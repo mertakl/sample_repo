@@ -1,36 +1,3 @@
-Can you fix the following sonar issues in the following code?
-###Issues
-
-def __init__(self, cos_api, csv_file_name: str = "sharepoint_metadata.csv"):  # noqa: D107
-Define a constant instead of duplicating this literal "sharepoint_metadata.csv" 3 times.
-----------
-def __init__(self, config: "SharePointConfig", azure_creds: "AzureCredentials"):  # noqa: D107
-Redefining name 'config' from outer scope (line 545) (Some other parts as well)
-
- @staticmethod
-    def _get_proxies() -> dict[str, str]:
-        """Get proxy configuration."""
-        proxy = os.getenv("PROXY")
-        return {"http": proxy, "https": proxy} if proxy else {}
-Redefining name 'args' from outer scope (line 374) (Some other parts as well)
-----------------
-
-except Exception as e:
-Catching too general exception Exception (Another part as well)
-
--------------
-
-if __name__ == "__main__":
-    """Runs sharepoint_client with args."""
-String statement has no effect
-
--------------
-    except Exception as e:
-            logger.error("Failed to process deleted files: %s", e)
-            pass
-Remove this unneeded "pass".
-
-###End Issues
 """This module provides utilities for connecting Sharepoint."""
 
 import argparse
@@ -54,6 +21,9 @@ from bnppf_rag_engine.cos.bucket_interaction import create_cos_api
 from bnppf_rag_engine.rag_engine.document_parser import DocumentParser
 
 logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_CSV_FILENAME = "sharepoint_metadata.csv"
 
 load_dotenv()
 
@@ -125,8 +95,8 @@ class ProcessedDocument:
 class SharePointAuthenticator:
     """Handles SharePoint authentication logic."""
 
-    def __init__(self, config: "SharePointConfig", azure_creds: "AzureCredentials"):  # noqa: D107
-        self.config = config
+    def __init__(self, sp_config: "SharePointConfig", azure_creds: "AzureCredentials"):  # noqa: D107
+        self.config = sp_config
         self.azure_creds = azure_creds
         self.azure_creds.client_creds = self._get_client_creds()
         self._access_token: str | None = None
@@ -173,15 +143,15 @@ class SharePointAuthenticator:
     @staticmethod
     def _get_proxies() -> dict[str, str]:
         """Get proxy configuration."""
-        proxy = os.getenv("PROXY")
-        return {"http": proxy, "https": proxy} if proxy else {}
+        proxy_url = os.getenv("PROXY")
+        return {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
 
 class SharePointAPIClient:
     """Handles SharePoint API communication."""
 
-    def __init__(self, config: "SharePointConfig", authenticator: SharePointAuthenticator):  # noqa: D107
-        self.config = config
+    def __init__(self, sp_config: "SharePointConfig", authenticator: SharePointAuthenticator):  # noqa: D107
+        self.config = sp_config
         self.authenticator = authenticator
 
     def send_request(self, endpoint: str) -> dict[str, Any]:
@@ -259,7 +229,7 @@ class DocumentFilter:
 class MetadataManager:
     """Manages CSV metadata operations."""
 
-    def __init__(self, cos_api, csv_file_name: str = "sharepoint_metadata.csv"):  # noqa: D107
+    def __init__(self, cos_api, csv_file_name: str = DEFAULT_CSV_FILENAME):  # noqa: D107
         self.cos_api = cos_api
         self.csv_file_name = csv_file_name
 
@@ -272,7 +242,7 @@ class MetadataManager:
             df = self.cos_api.read_csv(csv_path, sep=";")
             filtered_df = df[df["file_name"] == file_name]
             return filtered_df.iloc[0].to_dict() if not filtered_df.empty else None
-        except Exception:
+        except (pd.errors.EmptyDataError, KeyError, IndexError):
             return None
 
     def write_metadata(self, metadata: DocumentMetadata, csv_path: str) -> None:
@@ -288,7 +258,7 @@ class MetadataManager:
 
             self.cos_api.df_to_csv(df=updated_df, cos_filename=csv_path, header=True)
 
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             raise OSError(f"Failed to write metadata to {csv_path}: {e}") from e
 
     def remove_metadata(self, csv_path: str, file_name: str) -> None:
@@ -303,7 +273,7 @@ class MetadataManager:
             if not updated_df.empty:
                 self.cos_api.df_to_csv(df=updated_df, cos_filename=csv_path, header=True)
 
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             raise OSError(f"Failed to remove metadata from {csv_path}: {e}") from e
 
     @staticmethod
@@ -350,7 +320,7 @@ class DocumentProcessor:
 
     def delete_document(self, file_name: str, cos_folder_path: Path) -> None:
         """Delete document from COS and update metadata."""
-        csv_path = str(cos_folder_path / "sharepoint_metadata.csv")
+        csv_path = str(cos_folder_path / DEFAULT_CSV_FILENAME)
         metadata = self.metadata_manager.get_metadata_by_filename(csv_path, file_name)
 
         if not metadata:
@@ -393,20 +363,20 @@ class DocumentProcessor:
                 source=doc.source,
             )
 
-            csv_path = str(cos_folder_path / "sharepoint_metadata.csv")
+            csv_path = str(cos_folder_path / DEFAULT_CSV_FILENAME)
             self.metadata_manager.write_metadata(metadata, csv_path)
 
         finally:
             # Clean up temporary file
             os.unlink(temp_file_path)
 
-    def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument) -> None:
+    def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument, parsed_args) -> None:
         """Log unparseable document."""
         DocumentParser.write_unparsed_docs(
             unparsable_docs=[file_name],
-            source=doc.get("Source", "eureka"),
-            language=doc.get("Language", "fr"),
-            project_name=args.project_name,
+            source=doc.source,
+            language=doc.language,
+            project_name=parsed_args.project_name,
         )
 
         _, extension = os.path.splitext(file_name)
@@ -416,21 +386,21 @@ class DocumentProcessor:
 class SharePointClient:
     """Main SharePoint client class."""
 
-    def __init__(self, config: "SharePointConfig"):  # noqa: D107
-        self.config = config
+    def __init__(self, sp_config: "SharePointConfig"):  # noqa: D107
+        self.config = sp_config
         self.cos_api = self._create_cos_api()
 
         # Initialize components
         self.azure_creds = self._initialize_azure_credentials()
-        self.authenticator = SharePointAuthenticator(config, self.azure_creds)
-        self.api_client = SharePointAPIClient(config, self.authenticator)
+        self.authenticator = SharePointAuthenticator(sp_config, self.azure_creds)
+        self.api_client = SharePointAPIClient(sp_config, self.authenticator)
         self.metadata_manager = MetadataManager(self.cos_api)
         self.document_processor = DocumentProcessor(self.api_client, self.cos_api, self.metadata_manager)
 
-    def run(self, args) -> None:
+    def run(self, parsed_args) -> None:
         """Main execution method."""
-        config_handler = self._get_config_handler(args.project_name)
-        languages = self._get_languages(args, config_handler)
+        config_handler = self._get_config_handler(parsed_args.project_name)
+        languages = self._get_languages(parsed_args, config_handler)
         cos_folder_path = Path(config_handler.get_config("document_parser")["document_object_cos_folder"])
 
         # Handle deleted files
@@ -441,7 +411,7 @@ class SharePointClient:
 
         for language in languages:
             documents = grouped_documents.get(language, {})
-            self._process_documents_by_language(documents, cos_folder_path)
+            self._process_documents_by_language(documents, cos_folder_path, parsed_args)
 
     def _process_deleted_files(self, cos_folder_path: Path) -> None:
         """Process deleted files from recycle bin."""
@@ -449,11 +419,10 @@ class SharePointClient:
             deleted_files = self._get_deleted_file_names()
             for file_name in deleted_files:
                 self.document_processor.delete_document(file_name, cos_folder_path)
-        except Exception as e:
+        except (ConnectionError, ValueError, KeyError) as e:
             logger.error("Failed to process deleted files: %s", e)
-            pass
 
-    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], cos_folder_path: Path) -> None:
+    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], cos_folder_path: Path, parsed_args) -> None:
         """Process documents grouped by source for a specific language."""
         for source, doc_list in documents_by_source.items():
             for doc_data in doc_list:
@@ -477,7 +446,7 @@ class SharePointClient:
                     source = doc.get("Source")
                     if language and source:
                         grouped_documents[language][source].append(doc)
-            except Exception as e:
+            except (ConnectionError, KeyError, ValueError) as e:
                 logger.error("Error processing library %s: %s", library, e)
                 continue
 
@@ -505,7 +474,7 @@ class SharePointClient:
             response = self.api_client.send_request("/_api/site/RecycleBin?$filter=ItemState eq 1")
             deleted_documents = response.get("d", {}).get("results", [])
             return [doc.get("Title", "") for doc in deleted_documents if doc.get("Title")]
-        except Exception:
+        except (ConnectionError, KeyError):
             return []
 
     def _initialize_azure_credentials(self) -> "AzureCredentials":
@@ -527,10 +496,10 @@ class SharePointClient:
         return get_or_raise_config(project_name)
 
     @staticmethod
-    def _get_languages(args, config_handler) -> list[str]:
+    def _get_languages(parsed_args, config_handler) -> list[str]:
         """Get list of languages to process."""
-        if hasattr(args, "language") and args.language:
-            return [args.language]
+        if hasattr(parsed_args, "language") and parsed_args.language:
+            return [parsed_args.language]
         return config_handler.get_config("languages")
 
 
@@ -560,8 +529,7 @@ def commandline_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    """Runs sharepoint_client with args."""
-    args = commandline_parser().parse_args()
+    parsed_args = commandline_parser().parse_args()
 
     # Initialize the SharePointClient
     crt_content = os.getenv("SHAREPOINT_TLS_CERTIFICATE").replace("\\n", "\n")
@@ -575,14 +543,11 @@ if __name__ == "__main__":
         key_file.write(key_content)
         key_path = key_file.name
 
-    config = SharePointConfig(crt_filepath=crt_path, key_filepath=key_path, site_name="EurekaTestSite")
+    sharepoint_config = SharePointConfig(crt_filepath=crt_path, key_filepath=key_path, site_name="EurekaTestSite")
 
-    sharepoint_client = SharePointClient(config)
+    sharepoint_client = SharePointClient(sharepoint_config)
 
-    sharepoint_client.run(args=args)
+    sharepoint_client.run(parsed_args=parsed_args)
 
     os.unlink(key_path)
     os.unlink(crt_path)
-
-
-

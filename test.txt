@@ -1,0 +1,747 @@
+"""Functional tests for SharePoint integration module."""
+
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import Mock, patch, mock_open, MagicMock
+from dataclasses import dataclass
+import pytest
+import pandas as pd
+import requests
+
+# Import the classes from your module - adjust the import path as needed
+from sharepoint_integration import (
+    SharePointConfig,
+    AzureCredentials,
+    DocumentMetadata,
+    ProcessedDocument,
+    SharePointAuthenticator,
+    SharePointAPIClient,
+    DocumentFilter,
+    MetadataManager,
+    DocumentProcessor,
+    SharePointClient,
+)
+
+
+class TestSharePointConfig:
+    """Test SharePointConfig dataclass."""
+    
+    def test_sharepoint_config_creation(self):
+        """Test SharePointConfig initialization."""
+        config = SharePointConfig(
+            crt_filepath="/path/to/cert.crt",
+            key_filepath="/path/to/key.key",
+            site_name="test_site"
+        )
+        
+        assert config.crt_filepath == "/path/to/cert.crt"
+        assert config.key_filepath == "/path/to/key.key"
+        assert config.site_name == "test_site"
+        assert config.site_base == "https://bnpparibas.sharepoint.com"
+
+    def test_sharepoint_config_custom_base(self):
+        """Test SharePointConfig with custom site_base."""
+        config = SharePointConfig(
+            crt_filepath="/path/to/cert.crt",
+            key_filepath="/path/to/key.key",
+            site_name="test_site",
+            site_base="https://custom.sharepoint.com"
+        )
+        
+        assert config.site_base == "https://custom.sharepoint.com"
+
+
+class TestAzureCredentials:
+    """Test AzureCredentials dataclass."""
+    
+    @patch.dict(os.environ, {
+        'AZURE_CLIENT_ID': 'test_client_id',
+        'THUMBPRINT': 'test_thumbprint'
+    })
+    def test_from_env(self):
+        """Test AzureCredentials.from_env creation."""
+        tenant_id = "test_tenant_id"
+        site_base = "https://test.sharepoint.com"
+        
+        creds = AzureCredentials.from_env(tenant_id, site_base)
+        
+        assert creds.client_id == "test_client_id"
+        assert creds.tenant_id == tenant_id
+        assert creds.authority == f"https://login.microsoftonline.com/{tenant_id}"
+        assert creds.scope == [f"{site_base}/.default"]
+        assert creds.thumbprint == "test_thumbprint"
+        assert creds.client_creds == {}
+
+
+class TestDocumentFilter:
+    """Test DocumentFilter class."""
+    
+    def test_is_parseable_valid_extensions(self):
+        """Test parseable file detection for valid extensions."""
+        assert DocumentFilter.is_parseable("document.doc")
+        assert DocumentFilter.is_parseable("document.docx")
+        assert DocumentFilter.is_parseable("DOCUMENT.DOC")
+        assert DocumentFilter.is_parseable("DOCUMENT.DOCX")
+    
+    def test_is_parseable_invalid_extensions(self):
+        """Test parseable file detection for invalid extensions."""
+        assert not DocumentFilter.is_parseable("document.pdf")
+        assert not DocumentFilter.is_parseable("document.txt")
+        assert not DocumentFilter.is_parseable("document.xlsx")
+        assert not DocumentFilter.is_parseable("document")
+    
+    def test_is_recently_modified_recent_file(self):
+        """Test recent modification detection for recent files."""
+        recent_time = datetime.now(timezone.utc) - timedelta(hours=12)
+        time_str = recent_time.isoformat().replace('+00:00', 'Z')
+        
+        assert DocumentFilter.is_recently_modified(time_str, hours=24)
+    
+    def test_is_recently_modified_old_file(self):
+        """Test recent modification detection for old files."""
+        old_time = datetime.now(timezone.utc) - timedelta(hours=48)
+        time_str = old_time.isoformat().replace('+00:00', 'Z')
+        
+        assert not DocumentFilter.is_recently_modified(time_str, hours=24)
+    
+    def test_is_recently_modified_invalid_datetime(self):
+        """Test recent modification detection with invalid datetime."""
+        assert not DocumentFilter.is_recently_modified("invalid_datetime")
+        assert not DocumentFilter.is_recently_modified("")
+        assert not DocumentFilter.is_recently_modified(None)
+
+
+class TestSharePointAuthenticator:
+    """Test SharePointAuthenticator class."""
+    
+    @pytest.fixture
+    def mock_config(self):
+        """Create mock SharePoint config."""
+        return SharePointConfig(
+            crt_filepath="/path/to/cert.crt",
+            key_filepath="/path/to/key.key",
+            site_name="test_site"
+        )
+    
+    @pytest.fixture
+    def mock_azure_creds(self):
+        """Create mock Azure credentials."""
+        return AzureCredentials(
+            client_id="test_client_id",
+            tenant_id="test_tenant_id",
+            authority="https://login.microsoftonline.com/test_tenant_id",
+            scope=["https://test.sharepoint.com/.default"],
+            thumbprint="test_thumbprint",
+            client_creds={}
+        )
+    
+    @patch('builtins.open', mock_open(read_data="file_content"))
+    def test_get_client_creds(self, mock_config, mock_azure_creds):
+        """Test client credentials retrieval."""
+        authenticator = SharePointAuthenticator(mock_config, mock_azure_creds)
+        
+        creds = authenticator._get_client_creds()
+        
+        assert creds["private_key"] == "file_content"
+        assert creds["thumbprint"] == "test_thumbprint"
+        assert creds["public_certificate"] == "file_content"
+    
+    @patch.dict(os.environ, {'PROXY': 'http://proxy.example.com'})
+    def test_get_proxies_with_proxy(self):
+        """Test proxy configuration when PROXY env var is set."""
+        proxies = SharePointAuthenticator._get_proxies()
+        
+        expected = {
+            "http": "http://proxy.example.com",
+            "https": "http://proxy.example.com"
+        }
+        assert proxies == expected
+    
+    @patch.dict(os.environ, {}, clear=True)
+    def test_get_proxies_without_proxy(self):
+        """Test proxy configuration when PROXY env var is not set."""
+        proxies = SharePointAuthenticator._get_proxies()
+        assert proxies == {}
+    
+    @patch('sharepoint_integration.ConfidentialClientApplication')
+    @patch('builtins.open', mock_open(read_data="file_content"))
+    def test_acquire_token_success(self, mock_app_class, mock_config, mock_azure_creds):
+        """Test successful token acquisition."""
+        # Setup mocks
+        mock_app = Mock()
+        mock_app.acquire_token_for_client.return_value = {
+            "access_token": "test_access_token"
+        }
+        mock_app_class.return_value = mock_app
+        
+        authenticator = SharePointAuthenticator(mock_config, mock_azure_creds)
+        
+        token = authenticator._acquire_token()
+        
+        assert token == "test_access_token"
+        mock_app.acquire_token_for_client.assert_called_once()
+    
+    @patch('sharepoint_integration.ConfidentialClientApplication')
+    @patch('builtins.open', mock_open(read_data="file_content"))
+    def test_acquire_token_error(self, mock_app_class, mock_config, mock_azure_creds):
+        """Test token acquisition with error response."""
+        # Setup mocks
+        mock_app = Mock()
+        mock_app.acquire_token_for_client.return_value = {
+            "error": "invalid_client"
+        }
+        mock_app_class.return_value = mock_app
+        
+        authenticator = SharePointAuthenticator(mock_config, mock_azure_creds)
+        
+        with pytest.raises(ValueError, match="Error getting access token"):
+            authenticator._acquire_token()
+
+
+class TestSharePointAPIClient:
+    """Test SharePointAPIClient class."""
+    
+    @pytest.fixture
+    def mock_config(self):
+        """Create mock SharePoint config."""
+        return SharePointConfig(
+            crt_filepath="/path/to/cert.crt",
+            key_filepath="/path/to/key.key",
+            site_name="test_site"
+        )
+    
+    @pytest.fixture
+    def mock_authenticator(self):
+        """Create mock authenticator."""
+        authenticator = Mock()
+        authenticator.get_access_token.return_value = "test_token"
+        authenticator._get_proxies.return_value = {}
+        return authenticator
+    
+    def test_build_url(self, mock_config, mock_authenticator):
+        """Test URL building."""
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        url = client._build_url("/_api/web/lists")
+        expected = "https://bnpparibas.sharepoint.com/sites/test_site/_api/web/lists"
+        
+        assert url == expected
+    
+    def test_build_url_with_leading_slash(self, mock_config, mock_authenticator):
+        """Test URL building with leading slash in endpoint."""
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        url = client._build_url("/_api/web/lists")
+        expected = "https://bnpparibas.sharepoint.com/sites/test_site/_api/web/lists"
+        
+        assert url == expected
+    
+    def test_get_headers(self, mock_config, mock_authenticator):
+        """Test request headers generation."""
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        headers = client._get_headers()
+        
+        expected = {
+            "Authorization": "Bearer test_token",
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose",
+        }
+        assert headers == expected
+    
+    @patch('sharepoint_integration.requests.get')
+    def test_send_request_success(self, mock_get, mock_config, mock_authenticator):
+        """Test successful API request."""
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.json.return_value = {"test": "data"}
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        result = client.send_request("/_api/web/lists")
+        
+        assert result == {"test": "data"}
+        mock_get.assert_called_once()
+    
+    @patch('sharepoint_integration.requests.get')
+    def test_send_request_json_decode_error(self, mock_get, mock_config, mock_authenticator):
+        """Test API request with JSON decode error."""
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.json.side_effect = requests.JSONDecodeError("msg", "doc", 0)
+        mock_response.content = b"raw content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        result = client.send_request("/_api/web/lists")
+        
+        assert result == {"content": b"raw content"}
+    
+    @patch('sharepoint_integration.requests.get')
+    def test_send_request_connection_error(self, mock_get, mock_config, mock_authenticator):
+        """Test API request with connection error."""
+        mock_get.side_effect = requests.ConnectionError("Connection failed")
+        
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        with pytest.raises(ConnectionError, match="Failed to send request"):
+            client.send_request("/_api/web/lists")
+    
+    @patch('sharepoint_integration.requests.get')
+    def test_download_file_success(self, mock_get, mock_config, mock_authenticator):
+        """Test successful file download."""
+        mock_response = Mock()
+        mock_response.content = b"file content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+        
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+        
+        content = client.download_file("/sites/test/document.docx")
+        
+        assert content == b"file content"
+
+
+class TestMetadataManager:
+    """Test MetadataManager class."""
+    
+    @pytest.fixture
+    def mock_cos_api(self):
+        """Create mock COS API."""
+        return Mock()
+    
+    @pytest.fixture
+    def metadata_manager(self, mock_cos_api):
+        """Create MetadataManager instance."""
+        return MetadataManager(mock_cos_api, "test_metadata.csv")
+    
+    def test_get_metadata_by_filename_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for existing file."""
+        # Setup mock data
+        test_df = pd.DataFrame([
+            {
+                "file_name": "test.docx",
+                "url": "/test/test.docx",
+                "created_by": "user@example.com",
+                "last_modified": "2023-01-01T00:00:00Z",
+                "nota_number": "123",
+                "language": "EN",
+                "source": "test_source"
+            }
+        ])
+        
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
+        
+        result = metadata_manager.get_metadata_by_filename("test_path.csv", "test.docx")
+        
+        assert result["file_name"] == "test.docx"
+        assert result["url"] == "/test/test.docx"
+    
+    def test_get_metadata_by_filename_not_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for non-existing file."""
+        mock_cos_api.file_exists.return_value = False
+        
+        result = metadata_manager.get_metadata_by_filename("test_path.csv", "test.docx")
+        
+        assert result is None
+    
+    def test_get_metadata_by_filename_file_not_found(self, metadata_manager, mock_cos_api):
+        """Test getting metadata when file is not in CSV."""
+        test_df = pd.DataFrame([
+            {
+                "file_name": "other.docx",
+                "url": "/test/other.docx",
+                "created_by": "user@example.com",
+                "last_modified": "2023-01-01T00:00:00Z",
+                "nota_number": "123",
+                "language": "EN",
+                "source": "test_source"
+            }
+        ])
+        
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
+        
+        result = metadata_manager.get_metadata_by_filename("test_path.csv", "test.docx")
+        
+        assert result is None
+    
+    def test_write_metadata_new_file(self, metadata_manager, mock_cos_api):
+        """Test writing metadata for new CSV file."""
+        mock_cos_api.file_exists.return_value = False
+        
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source"
+        )
+        
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+        
+        mock_cos_api.df_to_csv.assert_called_once()
+    
+    def test_write_metadata_existing_file(self, metadata_manager, mock_cos_api):
+        """Test writing metadata to existing CSV file."""
+        existing_df = pd.DataFrame([
+            {
+                "file_name": "other.docx",
+                "url": "/test/other.docx",
+                "created_by": "user@example.com",
+                "last_modified": "2023-01-01T00:00:00Z",
+                "nota_number": "456",
+                "language": "FR",
+                "source": "other_source"
+            }
+        ])
+        
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+        
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source"
+        )
+        
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+        
+        mock_cos_api.df_to_csv.assert_called_once()
+    
+    def test_remove_metadata(self, metadata_manager, mock_cos_api):
+        """Test removing metadata."""
+        existing_df = pd.DataFrame([
+            {
+                "file_name": "test.docx",
+                "url": "/test/test.docx",
+                "created_by": "user@example.com",
+                "last_modified": "2023-01-01T00:00:00Z",
+                "nota_number": "123",
+                "language": "EN",
+                "source": "test_source"
+            },
+            {
+                "file_name": "other.docx",
+                "url": "/test/other.docx",
+                "created_by": "user@example.com",
+                "last_modified": "2023-01-01T00:00:00Z",
+                "nota_number": "456",
+                "language": "FR",
+                "source": "other_source"
+            }
+        ])
+        
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+        
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+        
+        mock_cos_api.df_to_csv.assert_called_once()
+
+
+class TestDocumentProcessor:
+    """Test DocumentProcessor class."""
+    
+    @pytest.fixture
+    def mock_api_client(self):
+        """Create mock API client."""
+        return Mock()
+    
+    @pytest.fixture
+    def mock_cos_api(self):
+        """Create mock COS API."""
+        return Mock()
+    
+    @pytest.fixture
+    def mock_metadata_manager(self):
+        """Create mock metadata manager."""
+        return Mock()
+    
+    @pytest.fixture
+    def document_processor(self, mock_api_client, mock_cos_api, mock_metadata_manager):
+        """Create DocumentProcessor instance."""
+        return DocumentProcessor(mock_api_client, mock_cos_api, mock_metadata_manager)
+    
+    def test_process_document_unparseable(self, document_processor):
+        """Test processing unparseable document."""
+        doc = ProcessedDocument(
+            file={"Name": "test.pdf", "TimeLastModified": "2023-01-01T00:00:00Z"},
+            nota_number="123",
+            source="test_source",
+            language="EN"
+        )
+        
+        # Should not raise exception, just log and return
+        document_processor.process_document(doc, Path("/test"))
+    
+    def test_process_document_not_recent(self, document_processor):
+        """Test processing document that's not recently modified."""
+        old_time = datetime.now(timezone.utc) - timedelta(hours=48)
+        time_str = old_time.isoformat().replace('+00:00', 'Z')
+        
+        doc = ProcessedDocument(
+            file={"Name": "test.docx", "TimeLastModified": time_str},
+            nota_number="123",
+            source="test_source",
+            language="EN"
+        )
+        
+        # Should not process old documents
+        document_processor.process_document(doc, Path("/test"))
+        document_processor.api_client.download_file.assert_not_called()
+    
+    @patch('sharepoint_integration.tempfile.NamedTemporaryFile')
+    @patch('sharepoint_integration.os.unlink')
+    def test_process_document_success(self, mock_unlink, mock_temp_file, document_processor):
+        """Test successful document processing."""
+        # Setup recent time
+        recent_time = datetime.now(timezone.utc) - timedelta(hours=12)
+        time_str = recent_time.isoformat().replace('+00:00', 'Z')
+        
+        doc = ProcessedDocument(
+            file={
+                "Name": "test.docx",
+                "ServerRelativeUrl": "/sites/test/test.docx",
+                "TimeLastModified": time_str,
+                "Author": "user@example.com"
+            },
+            nota_number="123",
+            source="test_source",
+            language="EN"
+        )
+        
+        # Setup mocks
+        mock_temp_file_obj = Mock()
+        mock_temp_file_obj.name = "/tmp/temp_file.docx"
+        mock_temp_file_obj.__enter__ = Mock(return_value=mock_temp_file_obj)
+        mock_temp_file_obj.__exit__ = Mock(return_value=None)
+        mock_temp_file.return_value = mock_temp_file_obj
+        
+        document_processor.api_client.download_file.return_value = b"file content"
+        
+        document_processor.process_document(doc, Path("/test"))
+        
+        # Verify API calls
+        document_processor.api_client.download_file.assert_called_once_with("/sites/test/test.docx")
+        document_processor.cos_api.upload_file.assert_called_once()
+        document_processor.metadata_manager.write_metadata.assert_called_once()
+        mock_unlink.assert_called_once()
+    
+    def test_delete_document_success(self, document_processor):
+        """Test successful document deletion."""
+        metadata = {
+            "file_name": "test.docx",
+            "source": "test_source",
+            "language": "EN"
+        }
+        
+        document_processor.metadata_manager.get_metadata_by_filename.return_value = metadata
+        
+        document_processor.delete_document("test.docx", Path("/test"))
+        
+        document_processor.cos_api.delete_file.assert_called_once()
+        document_processor.metadata_manager.remove_metadata.assert_called_once()
+    
+    def test_delete_document_not_found(self, document_processor):
+        """Test deleting document that's not in metadata."""
+        document_processor.metadata_manager.get_metadata_by_filename.return_value = None
+        
+        document_processor.delete_document("test.docx", Path("/test"))
+        
+        document_processor.cos_api.delete_file.assert_not_called()
+        document_processor.metadata_manager.remove_metadata.assert_not_called()
+
+
+class TestSharePointClient:
+    """Test SharePointClient class integration."""
+    
+    @pytest.fixture
+    def mock_config(self):
+        """Create mock SharePoint config."""
+        return SharePointConfig(
+            crt_filepath="/path/to/cert.crt",
+            key_filepath="/path/to/key.key",
+            site_name="test_site"
+        )
+    
+    @patch('sharepoint_integration.create_cos_api')
+    @patch('sharepoint_integration.os.getenv')
+    @patch('builtins.open', mock_open(read_data="file_content"))
+    def test_sharepoint_client_initialization(self, mock_getenv, mock_create_cos_api, mock_config):
+        """Test SharePoint client initialization."""
+        mock_getenv.return_value = "test_tenant_id"
+        mock_create_cos_api.return_value = Mock()
+        
+        client = SharePointClient(mock_config)
+        
+        assert client.config == mock_config
+        assert client.cos_api is not None
+        assert client.azure_creds is not None
+        assert client.authenticator is not None
+        assert client.api_client is not None
+        assert client.metadata_manager is not None
+        assert client.document_processor is not None
+    
+    @patch('sharepoint_integration.create_cos_api')
+    @patch('sharepoint_integration.get_or_raise_config')
+    @patch('sharepoint_integration.os.getenv')
+    @patch('builtins.open', mock_open(read_data="file_content"))
+    def test_run_method(self, mock_getenv, mock_get_config, mock_create_cos_api, mock_config):
+        """Test SharePoint client run method."""
+        # Setup mocks
+        mock_getenv.return_value = "test_tenant_id"
+        mock_cos_api = Mock()
+        mock_create_cos_api.return_value = mock_cos_api
+        
+        mock_config_handler = Mock()
+        mock_config_handler.get_config.side_effect = [
+            {"document_object_cos_folder": "/test/folder"},  # document_parser config
+            ["EN", "FR"]  # languages config
+        ]
+        mock_get_config.return_value = mock_config_handler
+        
+        # Create parsed args mock
+        parsed_args = Mock()
+        parsed_args.project_name = "test_project"
+        parsed_args.language = None
+        
+        client = SharePointClient(mock_config)
+        
+        # Mock the internal methods
+        client.api_client.send_request = Mock()
+        client.api_client.send_request.side_effect = [
+            # Mock recycle bin response
+            {"d": {"results": [{"Title": "deleted_file.docx"}]}},
+            # Mock documents library response
+            {"d": {"results": [
+                {
+                    "File": {
+                        "Name": "test.docx",
+                        "ServerRelativeUrl": "/sites/test/test.docx",
+                        "TimeLastModified": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
+                    },
+                    "notanumber": "123",
+                    "source": "test_source",
+                    "language": "EN"
+                }
+            ]}}
+        ]
+        
+        # Mock document processor methods
+        client.document_processor.delete_document = Mock()
+        client.document_processor.process_document = Mock()
+        
+        # Run the method
+        client.run(parsed_args)
+        
+        # Verify method calls
+        client.document_processor.delete_document.assert_called_once_with("deleted_file.docx", Path("/test/folder"))
+        client.document_processor.process_document.assert_called()
+
+
+@pytest.fixture
+def temp_files():
+    """Create temporary certificate and key files for testing."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as crt_file:
+        crt_file.write("-----BEGIN CERTIFICATE-----\ntest_cert_content\n-----END CERTIFICATE-----")
+        crt_path = crt_file.name
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as key_file:
+        key_file.write("-----BEGIN PRIVATE KEY-----\ntest_key_content\n-----END PRIVATE KEY-----")
+        key_path = key_file.name
+    
+    yield crt_path, key_path
+    
+    # Cleanup
+    os.unlink(crt_path)
+    os.unlink(key_path)
+
+
+class TestEndToEndIntegration:
+    """End-to-end integration tests."""
+    
+    @patch('sharepoint_integration.create_cos_api')
+    @patch('sharepoint_integration.get_or_raise_config')
+    @patch('sharepoint_integration.requests.get')
+    @patch('sharepoint_integration.ConfidentialClientApplication')
+    @patch.dict(os.environ, {
+        'AZURE_CLIENT_ID': 'test_client_id',
+        'AZURE_TENANT_ID': 'test_tenant_id',
+        'THUMBPRINT': 'test_thumbprint'
+    })
+    def test_end_to_end_document_processing(self, mock_app_class, mock_requests, mock_get_config, mock_create_cos_api, temp_files):
+        """Test end-to-end document processing flow."""
+        crt_path, key_path = temp_files
+        
+        # Setup SharePoint config
+        config = SharePointConfig(
+            crt_filepath=crt_path,
+            key_filepath=key_path,
+            site_name="test_site"
+        )
+        
+        # Setup mocks
+        mock_cos_api = Mock()
+        mock_create_cos_api.return_value = mock_cos_api
+        
+        mock_config_handler = Mock()
+        mock_config_handler.get_config.side_effect = [
+            {"document_object_cos_folder": "/test/folder"},
+            ["EN"]
+        ]
+        mock_get_config.return_value = mock_config_handler
+        
+        # Mock Azure authentication
+        mock_app = Mock()
+        mock_app.acquire_token_for_client.return_value = {"access_token": "test_token"}
+        mock_app_class.return_value = mock_app
+        
+        # Mock SharePoint API responses
+        recent_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        time_str = recent_time.isoformat().replace('+00:00', 'Z')
+        
+        mock_responses = [
+            # Recycle bin response
+            Mock(json=lambda: {"d": {"results": []}}, raise_for_status=lambda: None),
+            # Documents library response
+            Mock(json=lambda: {"d": {"results": [
+                {
+                    "File": {
+                        "Name": "test.docx",
+                        "ServerRelativeUrl": "/sites/test/test.docx",
+                        "TimeLastModified": time_str
+                    },
+                    "notanumber": "123",
+                    "source": "test_source",
+                    "language": "EN",
+                    "Author": "user@example.com"
+                }
+            ]}}, raise_for_status=lambda: None),
+            # File download response
+            Mock(content=b"file content", raise_for_status=lambda: None)
+        ]
+        mock_requests.side_effect = mock_responses
+        
+        # Create client and run
+        client = SharePointClient(config)
+        
+        parsed_args = Mock()
+        parsed_args.project_name = "test_project"
+        parsed_args.language = None
+        
+        # Mock metadata manager to avoid file operations
+        client.metadata_manager.write_metadata = Mock()

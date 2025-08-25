@@ -1,66 +1,78 @@
+from pathlib import Path
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
-def generate_valid_eureka_docx(filepath: str, language: str = "fr"):
+def create_valid_docx(filename: str, lang: str = "en") -> Path:
     """
-    Generates a .docx file that will pass update_titles_and_depths_eureka_nota.
-    
+    Generates a DOCX file with a structure that satisfies the
+    'update_titles_and_depths_eureka_nota' function.
+
+    The generated document includes:
+    - A main title and subtitle
+    - A 'Table of Contents' entry (required for validation)
+    - A Heading 1 and Heading 2 to be correctly recognized as titles.
+
     Args:
-        filepath (str): Where to save the docx
-        language (str): 'fr' or 'nl' for table of contents text
+        filename (str): The name of the file to create (e.g., 'valid_doc.docx').
+        lang (str): The language for the Table of Contents string ('fr' or 'nl').
+    
+    Returns:
+        Path: The path to the created DOCX file.
     """
-    doc = Document()
+    
+    # Define table of content text based on language
+    table_of_content_text = ""
+    if lang == "fr":
+        table_of_content_text = "Table des matières"
+    elif lang == "nl":
+        table_of_content_text = "Inhoudsopgave"
+    else:
+        print("Invalid language. Using 'Table of Contents' as default.")
+        table_of_content_text = "Table of Contents"
 
-    # === Main Title (depth 0) ===
-    title = doc.add_paragraph("Eureka Knowledge Document")
-    title.style = "Heading 1"
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Create a new Document
+    document = Document()
 
-    # === Subtitle (depth 1) ===
-    subtitle = doc.add_paragraph("Technical Guidelines")
-    subtitle.style = "Heading 2"
-    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Add a main title with a custom style
+    main_title_para = document.add_paragraph("Main Document Title", style="Title")
+    main_title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    main_title_para.paragraph_format.space_before = Pt(12)
 
-    doc.add_paragraph()  # spacer
+    # Add a main subtitle
+    subtitle_para = document.add_paragraph("Document Subtitle", style="Subtitle")
+    subtitle_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle_para.paragraph_format.space_after = Pt(24)
 
-    # === Table of Contents ===
-    toc_text = "table des matières" if language == "fr" else "inhoudsopgave"
-    toc = doc.add_paragraph(toc_text)
-    toc.style = "Heading 2"
+    # Add a table of contents entry. This is a crucial step for the
+    # update_titles_and_depths_eureka_nota function to pass validation.
+    # The 'TOC' is detected by specific keywords and the absence of a depth.
+    toc_para = document.add_paragraph(table_of_content_text, style="Contents1")
+    toc_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    
+    # Add a paragraph with a regular Heading 1 style
+    document.add_heading("Section 1: Introduction", level=1)
+    document.add_paragraph("This is the introduction section.")
 
-    doc.add_paragraph("1. Introduction ........................................ 1")
-    doc.add_paragraph("2. Methodology ...................................... 3")
-    doc.add_paragraph("3. Results ............................................... 5")
-    doc.add_paragraph("4. Conclusion ......................................... 8")
+    # Add a paragraph with a regular Heading 2 style
+    document.add_heading("Section 1.1: Details", level=2)
+    document.add_paragraph("More details about the introduction.")
+    
+    # Add some regular body text
+    document.add_paragraph("This is a simple text block.")
 
-    doc.add_paragraph()  # spacer
+    # Save the document to the specified file
+    filepath = Path(filename)
+    document.save(filepath)
 
-    # === Document Body with Headings and Text ===
-    h2 = doc.add_paragraph("Introduction")
-    h2.style = "Heading 2"
-
-    doc.add_paragraph("This section introduces the purpose of the Eureka document.")
-
-    h3 = doc.add_paragraph("Background")
-    h3.style = "Heading 3"
-    doc.add_paragraph("Some background information goes here.")
-
-    h2b = doc.add_paragraph("Methodology")
-    h2b.style = "Heading 2"
-    doc.add_paragraph("Details about the methodology.")
-
-    h2c = doc.add_paragraph("Results")
-    h2c.style = "Heading 2"
-    doc.add_paragraph("Results of the analysis.")
-
-    h2d = doc.add_paragraph("Conclusion")
-    h2d.style = "Heading 2"
-    doc.add_paragraph("Final conclusions and recommendations.")
-
-    # Save the document
-    doc.save(filepath)
-    print(f"✅ DOCX generated at: {filepath}")
-
+    print(f"✅ Successfully created DOCX file: {filepath.resolve()}")
+    return filepath
 
 if __name__ == "__main__":
-    generate_valid_eureka_docx("eureka_valid.docx", language="fr")
+    # Specify the name of the file to be created
+    output_filename = "test_document_for_eureka_nota.docx"
+    
+    # Run the function to create the document
+    create_valid_docx(output_filename, lang="fr")

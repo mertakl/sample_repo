@@ -1,24 +1,20 @@
-from argparse import Namespace
-from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+##Also this? 
 
+from unittest.mock import Mock
+
+import pandas as pd
 import pytest
 
-from bnppf_rag_engine.rag_engine.sharepoint.document_processor import (
-    DocumentProcessor,
+from bnppf_rag_engine.rag_engine.sharepoint.metadata_manager import (
+    MetadataManager,
 )
 from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
-    ProcessedDocument,
+    DocumentMetadata,
 )
 
 
-class TestDocumentProcessor:
-    """Test DocumentProcessor class."""
-
-    @pytest.fixture
-    def mock_api_client(self):
-        """Create mock API client."""
-        return Mock()
+class TestMetadataManager:
+    """Test MetadataManager class."""
 
     @pytest.fixture
     def mock_cos_api(self):
@@ -26,92 +22,238 @@ class TestDocumentProcessor:
         return Mock()
 
     @pytest.fixture
-    def mock_metadata_manager(self):
-        """Create mock metadata manager."""
-        return Mock()
+    def metadata_manager(self, mock_cos_api):
+        """Create MetadataManager instance."""
+        return MetadataManager(mock_cos_api)
 
-    @pytest.fixture
-    def document_processor(self, mock_api_client, mock_cos_api, mock_metadata_manager):
-        """Create DocumentProcessor instance."""
-        return DocumentProcessor(mock_api_client, mock_cos_api, mock_metadata_manager)
-
-    def test_process_document_not_recent(self, document_processor):
-        """Test processing document that's not recently modified."""
-        old_time = datetime.now(timezone.utc) - timedelta(hours=48)
-        time_str = old_time.isoformat().replace("+00:00", "Z")
-
-        doc = ProcessedDocument(
-            file={"Name": "test.docx", "TimeLastModified": time_str},
-            nota_number="123",
-            source="test_source",
-            language="EN",
+    def test_get_metadata_by_filename_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for existing file."""
+        # Setup mock data
+        test_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
         )
 
-        parsed_args = Namespace(project_name="test_project")
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
 
-        # Mock the file to exist in COS, so it's not processed
-        document_processor.cos_api.file_exists.return_value = True
+        result = metadata_manager.get_metadata_by_filename("test_path.csv", "test.docx")
 
-        # Should not process old documents that already exist
-        document_processor.process_document(doc, parsed_args)
-        document_processor.api_client.download_file.assert_not_called()
-        document_processor.cos_api.upload_file.assert_not_called()
+        assert result["file_name"] == "test.docx"
+        assert result["url"] == "/test/test.docx"
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.document_processor.tempfile.NamedTemporaryFile")
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.document_processor.os.unlink")
-    def test_process_document_success(self, mock_unlink, mock_temp_file, document_processor):
-        """Test successful document processing."""
-        # Setup recent time
-        recent_time = datetime.now(timezone.utc) - timedelta(hours=12)
-        time_str = recent_time.isoformat().replace("+00:00", "Z")
+    def test_get_metadata_by_filename_not_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for non-existing file."""
+        mock_cos_api.file_exists.return_value = False
 
-        doc = ProcessedDocument(
-            file={
-                "Name": "test.docx",
-                "ServerRelativeUrl": "/sites/test/test.docx",
-                "TimeLastModified": time_str,
-                "Author": "user@example.com",
-            },
-            nota_number="123",
-            source="test_source",
-            language="EN",
+        result = metadata_manager.get_metadata_by_filename("test_path.csv", "test.docx")
+
+        assert result is None
+
+    def test_get_metadata_by_filename_file_not_found(self, metadata_manager, mock_cos_api):
+        """Test getting metadata when file is not in CSV."""
+        test_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
         )
 
-        # Setup mocks
-        mock_temp_file_obj = Mock()
-        mock_temp_file_obj.name = "/tmp/temp_file.docx"
-        mock_temp_file_obj.__enter__ = Mock(return_value=mock_temp_file_obj)
-        mock_temp_file_obj.__exit__ = Mock(return_value=None)
-        mock_temp_file.return_value = mock_temp_file_obj
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
 
-        document_processor.api_client.download_file.return_value = b"file content"
+        result = metadata_manager.get_metadata_by_filename("test_path.csv", "test.docx")
 
-        parsed_args = Namespace(project_name="test_project")
+        assert result is None
 
-        document_processor.process_document(doc, parsed_args)
+    def test_write_metadata_new_file(self, metadata_manager, mock_cos_api):
+        """Test writing metadata for new CSV file."""
+        mock_cos_api.file_exists.return_value = False
 
-        # Verify API calls
-        document_processor.api_client.download_file.assert_called_once_with("/sites/test/test.docx")
-        document_processor.cos_api.upload_file.assert_called_once()
-        document_processor.metadata_manager.write_metadata.assert_called_once()
-        mock_unlink.assert_called_once()
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
 
-    def test_delete_document_success(self, document_processor):
-        """Test successful document deletion."""
-        metadata = {"file_name": "test.docx", "source": "test_source", "language": "EN"}
+        metadata_manager.write_metadata(metadata, "test_path.csv")
 
-        document_processor.metadata_manager.get_metadata_by_filename.return_value = metadata
+        mock_cos_api.df_to_csv.assert_called_once()
 
-        document_processor.delete_document("test.docx")
+    def test_write_metadata_existing_file(self, metadata_manager, mock_cos_api):
+        """Test writing metadata to existing CSV file."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "other_source",
+                }
+            ]
+        )
 
-        document_processor.cos_api.delete_file.assert_called_once()
-        document_processor.metadata_manager.remove_metadata.assert_called_once()
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
 
-    def test_delete_document_not_found(self, document_processor):
-        """Test deleting document that's not in metadata."""
-        document_processor.metadata_manager.get_metadata_by_filename.return_value = None
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
 
-        document_processor.delete_document("test.docx")
+        metadata_manager.write_metadata(metadata, "test_path.csv")
 
-        document_processor.cos_api.delete_file.assert_not_called()
-        document_processor.metadata_manager.remove_metadata.assert_not_called()
+        mock_cos_api.df_to_csv.assert_called_once()
+
+    def test_remove_metadata(self, metadata_manager, mock_cos_api):
+        """Test removing metadata."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                },
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "other_source",
+                },
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        mock_cos_api.df_to_csv.assert_called_once()
+
+
+
+##Original code;
+
+"""MetadataManager class."""
+
+import logging
+from typing import Any
+
+import pandas as pd
+from bnppf_cos import CosBucketApi
+
+from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
+    DocumentMetadata,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class MetadataManager:
+    """Manages CSV metadata operations."""
+
+    def __init__(self, cos_api: CosBucketApi):  # noqa: D107
+        self.cos_api = cos_api
+
+    def get_metadata_by_filename(self, file_name: str, metadata_path: str) -> dict[str, Any] | None:
+        """Get metadata for specific file."""
+        if not self.cos_api.file_exists(metadata_path):
+            return None
+
+        try:
+            df = self.cos_api.read_csv(metadata_path, sep=";")
+            filtered_df = df[df["file_name"] == file_name]
+            return filtered_df.iloc[0].to_dict() if not filtered_df.empty else None
+        except (pd.errors.EmptyDataError, KeyError, IndexError):
+            return None
+
+    def write_metadata(self, metadata: DocumentMetadata, metadata_path: str) -> None:
+        """Write metadata to CSV file."""
+        try:
+            logger.info("Writing metadata information...")
+            if self.cos_api.file_exists(metadata_path):
+                existing_df = self.cos_api.read_csv(metadata_path, sep=";")
+            else:
+                existing_df = self._create_empty_dataframe()
+
+            new_entry = pd.DataFrame([metadata.__dict__])
+            updated_df = self._merge_metadata(existing_df, new_entry)
+
+            self.cos_api.df_to_csv(df=updated_df, cos_filename=metadata_path, header=True)
+
+        except (OSError, pd.errors.ParserError) as e:
+            raise OSError(f"Failed to write metadata to {metadata_path}: {e}") from e
+
+    def remove_metadata(self, metadata_path: str, file_name: str) -> None:
+        """Remove metadata for specific file."""
+        if not self.cos_api.file_exists(metadata_path):
+            return
+
+        try:
+            logger.info("Removing metadata information for %s...", file_name)
+
+            df = self.cos_api.read_csv(metadata_path, sep=";")
+            updated_df = df[df["file_name"] != file_name]
+
+            if not updated_df.empty:
+                self.cos_api.df_to_csv(df=updated_df, cos_filename=metadata_path, header=True)
+
+        except (OSError, pd.errors.ParserError) as e:
+            raise OSError(f"Failed to remove metadata from {metadata_path}: {e}") from e
+
+    @staticmethod
+    def _create_empty_dataframe() -> pd.DataFrame:
+        """Create empty DataFrame with proper columns."""
+        columns = ["file_name", "url", "created_by", "last_modified", "nota_number", "language", "source"]
+        return pd.DataFrame(columns=columns)
+
+    @staticmethod
+    def _merge_metadata(existing_df: pd.DataFrame, new_entry: pd.DataFrame) -> pd.DataFrame:
+        """Merge new metadata entry with existing data."""
+        unique_cols = ["file_name", "source"]
+        mask = existing_df[unique_cols].eq(new_entry[unique_cols].iloc[0]).all(axis=1)
+
+        if not existing_df[mask].empty:
+            existing_df.update(new_entry)
+            return existing_df
+
+        logging.info("No update on medata file as nothing changed on it.")
+
+        return pd.concat([existing_df, new_entry], ignore_index=True)
+
+

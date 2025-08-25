@@ -1,442 +1,128 @@
-##I need you to write functional test for the following code;
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
 
------main.py
+# Assuming these imports are available in the test environment
+from orchestrator import SharePointOrchestrator, ProcessedDocument
+from project_args import ProjectArgs
 
-async def main(project_args) -> None:  # noqa: D103
-    # 1. Initialize Configuration
 
-    config_handler = get_or_raise_config(project_args.project_name)
-    cos_api = create_cos_api()
+class TestSharePointOrchestratorFunctional(unittest.TestCase):
+    """
+    Functional tests for the SharePointOrchestrator class.
+    Mocks external services to test the orchestration logic.
+    """
 
-    # 2. Instantiate Services (Dependency Injection)
+    def setUp(self):
+        """Set up mock dependencies and the orchestrator instance for each test."""
+        self.mock_sp_service = MagicMock()
+        self.mock_doc_processor = MagicMock()
+        # AsyncMock is used for methods that are async, like run() and update_for_language()
+        self.mock_db_manager = AsyncMock()
+        self.mock_config_handler = MagicMock()
 
-    # Initialize the SharePointClient
-    crt_content = os.environ["SHAREPOINT_TLS_CERTIFICATE"].replace("\\n", "\n")
-    key_content = os.environ["SHAREPOINT_TLS_KEY"].replace("\\n", "\n")
+        # Instantiate the orchestrator with the mocked dependencies
+        self.orchestrator = SharePointOrchestrator(
+            sharepoint_service=self.mock_sp_service,
+            document_processor=self.mock_doc_processor,
+            vector_db_manager=self.mock_db_manager,
+            config_handler=self.mock_config_handler,
+        )
 
-    with tempfile.NamedTemporaryFile("w", suffix=".crt", delete=False) as crt_file:
-        crt_file.write(crt_content)
-        crt_path = crt_file.name
+        # Mock the project arguments object
+        self.mock_project_args = MagicMock(spec=ProjectArgs)
+        self.mock_project_args.project_name = "test_project"
+        self.mock_project_args.language = None  # No language filter by default
 
-    with tempfile.NamedTemporaryFile("w", suffix=".key", delete=False) as key_file:
-        key_file.write(key_content)
-        key_path = key_file.name
+    def tearDown(self):
+        """Clean up mocks after each test."""
+        self.mock_sp_service.reset_mock()
+        self.mock_doc_processor.reset_mock()
+        self.mock_db_manager.reset_mock()
+        self.mock_config_handler.reset_mock()
 
-    sp_config = SharePointConfig(crt_filepath=crt_path, key_filepath=key_path, site_name="EurekaTestSite")
-    authenticator = SharePointAuthenticator(sp_config)
-    api_client = SharePointAPIClient(sp_config, authenticator)
-    metadata_manager = MetadataManager(cos_api)
-    document_parser = DocumentParser(config_handler)
+    async def test_run_with_new_documents(self):
+        """Test the orchestrator when new documents are available."""
+        # 1. Mock the SharePoint service to return no deleted files and some new documents
+        self.mock_sp_service.get_deleted_file_names.return_value = []
+        self.mock_sp_service.get_documents_by_language.return_value = {
+            "EN": {
+                "SourceA": [
+                    {
+                        "File": {"Name": "doc1.pdf", "TimeLastModified": "2023-01-01T12:00:00Z", "ServerRelativeUrl": "/sites/Test/doc1.pdf"},
+                        "Language": "EN",
+                        "Source": "SourceA",
+                    },
+                ]
+            }
+        }
+        # 2. Mock the document processor to indicate the file was uploaded/updated
+        self.mock_doc_processor.process_document.return_value = (True, b"file content")
+        # 3. Mock the config handler to return a list of languages
+        self.mock_config_handler.get_config.return_value = ["EN", "FR"]
 
-    sharepoint_service = SharePointService(api_client=api_client, config=sp_config)
-    document_processor = DocumentProcessor(api_client, cos_api, metadata_manager)
-    vector_db_manager = VectorDBManager(
-        config_handler=config_handler,
-        document_parser=document_parser,
-        cos_api=cos_api,
-    )
+        # Run the orchestrator
+        await self.orchestrator.run(self.mock_project_args)
 
-    client = SharePointOrchestrator(
-        sharepoint_service=sharepoint_service,
-        document_processor=document_processor,
-        vector_db_manager=vector_db_manager,
-        config_handler=config_handler,
-    )
+        # 4. Assertions to verify the correct behavior
+        self.mock_sp_service.get_deleted_file_names.assert_called_once()
+        self.mock_doc_processor.delete_document.assert_not_called()
+        self.mock_sp_service.get_documents_by_language.assert_called_once_with(["Documents"])
+        self.mock_doc_processor.process_document.assert_called_once()
+        self.mock_db_manager.update_for_language.assert_called_once_with(
+            language="EN",
+            new_documents=unittest.mock.ANY,  # We don't care about the exact list, just that it was passed
+            project_name="test_project",
+        )
 
-    await client.run(project_args)
+    async def test_run_with_deleted_documents(self):
+        """Test the orchestrator when files have been deleted from SharePoint."""
+        # 1. Mock the SharePoint service to return deleted file names
+        self.mock_sp_service.get_deleted_file_names.return_value = ["deleted_doc.docx", "old_file.pdf"]
+        self.mock_sp_service.get_documents_by_language.return_value = {}  # No new documents
 
-    os.unlink(key_path)
-    os.unlink(crt_path)
+        # 2. Run the orchestrator
+        await self.orchestrator.run(self.mock_project_args)
+
+        # 3. Assertions
+        self.mock_sp_service.get_deleted_file_names.assert_called_once()
+        self.assertEqual(self.mock_doc_processor.delete_document.call_count, 2)
+        self.mock_doc_processor.delete_document.assert_any_call(file_name="deleted_doc.docx")
+        self.mock_doc_processor.delete_document.assert_any_call(file_name="old_file.pdf")
+        self.mock_db_manager.update_for_language.assert_not_called()
+
+    async def test_run_with_language_filter(self):
+        """Test the orchestrator's language filter functionality."""
+        # 1. Set the language filter in the mock arguments
+        self.mock_project_args.language = "FR"
+        self.mock_config_handler.get_config.return_value = ["EN", "FR"]
+
+        # 2. Mock SharePoint to return documents in multiple languages
+        self.mock_sp_service.get_deleted_file_names.return_value = []
+        self.mock_sp_service.get_documents_by_language.return_value = {
+            "EN": {
+                "SourceA": [{"File": {"Name": "doc_en.pdf"}, "Language": "EN", "Source": "SourceA"}],
+            },
+            "FR": {
+                "SourceB": [{"File": {"Name": "doc_fr.docx"}, "Language": "FR", "Source": "SourceB"}],
+            },
+        }
+        self.mock_doc_processor.process_document.return_value = (True, b"file content")
+
+        # 3. Run the orchestrator
+        await self.orchestrator.run(self.mock_project_args)
+
+        # 4. Assertions
+        # The orchestrator should process all documents to check their status
+        self.assertEqual(self.mock_doc_processor.process_document.call_count, 2)
+        # However, it should only call update_for_language for the French documents
+        self.mock_db_manager.update_for_language.assert_called_once_with(
+            language="FR",
+            new_documents=unittest.mock.ANY,
+            project_name="test_project",
+        )
 
 
 if __name__ == "__main__":
-    args = commandline_parser().parse_args()
-    asyncio.run(main(args))
-	
-	
------------------------orchestaror.py
-
-class SharePointOrchestrator:
-    """Main SharePoint client to orchestrate document processing and vector DB updates."""
-
-    def __init__(
-        self,
-        sharepoint_service: SharePointService,
-        document_processor: DocumentProcessor,
-        vector_db_manager: VectorDBManager,
-        config_handler: ConfigHandler,
-    ):
-        """Initializes the orchestrator with dependency-injected services."""
-        self.sp_service = sharepoint_service
-        self.doc_processor = document_processor
-        self.db_manager = vector_db_manager
-        self.config_handler = config_handler
-
-    async def run(self, project_args) -> None:
-        """Main execution method to run the entire synchronization process."""
-        # 1. Handle deleted files
-        deleted_files = self.sp_service.get_deleted_file_names()
-        if deleted_files:
-            for file_name in deleted_files:
-                self.doc_processor.delete_document(file_name=file_name)
-
-        # 2. Fetch and process existing documents to find new/updated ones
-        all_documents_by_lang = self.sp_service.get_documents_by_language(["Documents"])
-        
-        newly_uploaded_by_lang = defaultdict(list)
-        for lang, sources in all_documents_by_lang.items():
-            for source, doc_list in sources.items():
-                for doc_data in doc_list:
-                    processed_doc = ProcessedDocument(
-                        file=doc_data["File"],
-                        nota_number=doc_data.get("NotaNumber"),
-                        source=source,
-                        language=lang,
-                    )
-                    
-                    # Determine if the doc is new and return its content
-                    was_uploaded, file_content = self.doc_processor.process_document(
-                        doc=processed_doc, parsed_args=project_args
-                    )
-                    
-                    if was_uploaded:
-                        processed_doc.content = file_content # Attach content for parsing
-                        newly_uploaded_by_lang[lang].append(processed_doc)
-
-        # Update Vector DB for each language that has new documents
-        languages_to_process = self._get_languages_to_process(project_args)
-        for lang in languages_to_process:
-            new_docs_for_lang = newly_uploaded_by_lang.get(lang)
-            if not new_docs_for_lang:
-                logger.info(f"No new documents to process for language: {lang}")
-                continue
-            
-            await self.db_manager.update_for_language(
-                language=lang,
-                new_documents=new_docs_for_lang,
-                project_name=project_args.project_name
-            )
-
-    def _get_languages_to_process(self, project_args) -> list[str]:
-        """Determines the list of languages to process based on arguments or config."""
-        if hasattr(project_args, "language") and project_args.language:
-            return [project_args.language]
-        return self.config_handler.get_config("languages")
-		
----------db_processor.py
-
-class DocumentProcessor:
-    """Processes SharePoint documents."""
-
-    def __init__(  # noqa: D107
-        self, api_client: SharePointAPIClient, cos_api: CosBucketApi, metadata_manager: MetadataManager
-    ):
-        self.api_client = api_client
-        self.cos_api = cos_api
-        self.metadata_manager = metadata_manager
-        self.path_manager = PathManager()
-
-    def process_document(self, doc: ProcessedDocument, parsed_args) -> tuple[bool, bytes]:
-        """Process a single document. Returns True if document was uploaded/updated."""
-        file_info = doc.file
-        file_name, last_modified, source, language = (
-            file_info["Name"],
-            file_info["TimeLastModified"],
-            doc.source,
-            doc.language,
-        )
-
-        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
-
-        if not DocumentFilter.is_parseable(file_name):
-            self._log_unparseable_document(file_name, doc, parsed_args)
-            return False, None
-
-        if not DocumentFilter.is_recently_modified(last_modified):
-            if not self.cos_api.file_exists(file_path):
-                # File does not exist, upload it
-                file_content = self._upload_document(doc, file_path)
-                return True, file_content
-            return False, None  # File exists and not recently modified
-
-        # File was recently modified, upload it
-        file_content =  self._upload_document(doc, file_path)
-        return True, file_content
-
-    def delete_document(self, file_name: str) -> None:
-        """Delete document from COS and update metadata."""
-        metadata_path = self.path_manager.get_metadata_path()
-
-        deleted_doc_metadata = self.metadata_manager.get_metadata_by_filename(
-            file_name=file_name, metadata_path=metadata_path
-        )
-
-        if not deleted_doc_metadata:
-            # Nothing to delete
-            return
-
-        # Delete file from COS
-        source, language = deleted_doc_metadata["source"], deleted_doc_metadata["language"]
-        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
-        logger.info("Deleting file %s", file_name)
-        self.cos_api.delete_file(str(file_path))
-
-        # Remove from metadata
-        self.metadata_manager.remove_metadata(metadata_path=metadata_path, file_name=file_name)
-
-    def _upload_document(self, doc: ProcessedDocument, document_path: str) -> None:
-        """Upload document to COS and save metadata."""
-        file_info = doc.file
-        file_name, server_relative_url = file_info["Name"], file_info["ServerRelativeUrl"]
-
-        logger.info("Downloading document %s from sharepoint...", file_name)
-
-        # Download file content
-        file_content = self.api_client.download_file(server_relative_url)
-
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as temp_file:
-            temp_file.write(file_content)
-            temp_file_path = temp_file.name
-
-        try:
-            logger.info("Uploading document %s to COS...", file_name)
-            # Upload to COS
-            self.cos_api.upload_file(temp_file_path, document_path)
-
-            # Save metadata
-            metadata = DocumentMetadata(
-                file_name=file_name,
-                url=server_relative_url,
-                created_by=file_info.get("Author"),
-                last_modified=file_info["TimeLastModified"],
-                nota_number=doc.nota_number,
-                language=doc.language,
-                source=doc.source,
-            )
-
-            metadata_path = self.path_manager.get_metadata_path()
-            self.metadata_manager.write_metadata(metadata, metadata_path)
-
-            return file_content
-
-        finally:
-            # Clean up temporary file
-            os.unlink(temp_file_path)
-
-    def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument, p_args) -> None:
-        """Log unparseable document."""
-        DocumentParser.write_unparsed_docs(
-            unparsable_docs=[file_name],
-            source=doc.source,
-            language=doc.language,
-            project_name=p_args.project_name,
-        )
-
-        _, extension = os.path.splitext(file_name)
-        logger.error("Files with extension '%s' are not supported", extension)
-		
--------------db_manager.py
-
-PARSER_NAME_TO_OBJECT = {
-    "HtmlParser": HtmlParser,
-    "EurekaDocxParser": EurekaDocxParser,
-    "DoclingParser": DoclingParser,
-}
-
-class VectorDBManager:
-    """Manages parsing, chunking, and updating the vector database."""
-
-    def __init__(self, config_handler: ConfigHandler, document_parser: DocumentParser, cos_api: CosBucketApi):  # noqa: D107
-        self.config_handler = config_handler
-        self.parser = document_parser
-        self.cos_api = cos_api
-
-    async def update_for_language(
-        self, language: str, new_documents: list[ProcessedDocument], project_name: str
-    ) -> None:
-        """Orchestrates the entire vector DB update process for a given language."""
-        logger.info(f"Updating vector DB for {language} with {len(new_documents)} new documents.")
-        try:
-            # 1. Parse documents
-            data_source_to_documents = await self._parse_documents(
-                language=language,
-                new_documents=new_documents,
-                project_name=project_name
-            )
-            if not any(data_source_to_documents.values()):
-                logger.info(f"No parseable documents found for {language}. Aborting update.")
-                return
-
-            # 2. Create chunks
-            document_chunks = self._create_document_chunks(data_source_to_documents)
-            if not document_chunks:
-                logger.info(f"No document chunks created for {language}. Aborting update.")
-                return
-
-            # 3. Initialize and update DB
-            vector_db = self._initialize_vector_db(language)
-            drop_and_resetup_vector_db(vector_db.vector_db_config) # Assuming this is a required step
-            await vector_db.from_chunks(document_chunks)
-
-            # 4. Save to object storage
-            await vector_db.to_cos(self.cos_api, should_overwrite_on_cos=True)
-            logger.info(f"Successfully updated vector DB for {language}.")
-
-        except Exception as e:
-            logger.error(f"Failed to update vector DB for {language}: {e}", exc_info=True)
-            # Optionally re-raise to halt execution
-            # raise
-
-    def _initialize_vector_db(self, language: str) -> VectorDB:
-        """Initializes and sets up a VectorDB instance."""
-        vector_db = VectorDB(
-            vector_db_config=self.config_handler.get_config("vector_db"),
-            embedding_model=BNPPFEmbeddings(self.config_handler.get_config("embedding_model")),
-            language=language,
-            project_name=self.config_handler.get_config("project_name"),
-        )
-        vector_db.setup_db_instance()
-        return vector_db
-
-    def _create_document_chunks(
-        self, data_source_to_documents: dict[str, list[Document]]
-    ) -> list[DocumentChunk]:
-        """Concatenates documents by source and splits them into chunks."""
-        splitter = DocumentSplitter(self.config_handler.get_config("document_splitter"))
-        documents = self.parser.concat_documents(document=data_source_to_documents)
-        document_chunks = splitter.split_documents(documents)
-
-        # Check for duplicate keys
-        unique_keys = len({chunk.key for chunk in document_chunks})
-        if unique_keys != len(document_chunks):
-            warnings.warn(
-                f"Duplicate keys found: {unique_keys} unique keys for {len(document_chunks)} chunks.",
-                stacklevel=2
-            )
-        return document_chunks
-
-    async def _parse_documents(
-        self, language: str, new_documents: list[ProcessedDocument], project_name: str
-    ) -> dict[str, list[Document]]:
-        """Parses a list of new documents, grouping them by their source."""
-        docs_by_source = defaultdict(list)
-        for doc in new_documents:
-            docs_by_source[doc.source].append(doc)
-
-        parsed_docs_by_source = defaultdict(list)
-        unparsable_docs_log = defaultdict(list)
-
-        for source, docs_to_parse in docs_by_source.items():
-            for doc in docs_to_parse:
-                try:
-                    parsed_doc = await self._parse_document_content(
-                        sp_file=doc.file, content=doc.content, source=source, language=language
-                    )
-                    if parsed_doc:
-                        parsed_docs_by_source[source].append(parsed_doc)
-                except Exception as e:
-                    file_name = doc.file.get("Name", "Unknown File")
-                    logger.error(f"Failed to parse document {file_name}: {e}")
-                    unparsable_docs_log[source].append(f"{file_name} because {e!s}")
-
-        for source, unparsable in unparsable_docs_log.items():
-            self.parser.write_unparsed_docs(unparsable, source, language, project_name)
-
-        return parsed_docs_by_source
-
-    async def _parse_document_content(
-        self, sp_file: dict, content: bytes, source: str, language: str
-    ) -> Document | None:
-        """Parses a single document's content from a temporary file."""
-        file_name = sp_file.get("Name")
-        if not file_name:
-            logger.warning("SharePoint file has no name, cannot parse.")
-            return None
-
-        file_extension = Path(file_name).suffix.lstrip('.').lower()
-        parser_config = self.parser.parser_config
-
-        if file_extension not in parser_config["sources"].get(source, []):
-            logger.warning(f"File extension '.{file_extension}' not supported for source '{source}'.")
-            return None
-
-        parser_info = parser_config["extension_to_parser_map"][file_extension]
-        file_parser = PARSER_NAME_TO_OBJECT[parser_info["name"]](**parser_info["kwargs"])
-
-        with NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as temp_file:
-            temp_file.write(content)
-            temp_file_path = Path(temp_file.name)
-
-        try:
-            document = await file_parser.parse_as_document(path=temp_file_path, id=file_name)
-            if source == EUREKA:
-                # Apply source-specific post-processing
-                document = update_titles_and_depths_eureka_nota(
-                    document=document,
-                    titles=get_titles(filepath=str(temp_file_path)),
-                    language=language,
-                )
-            return document
-        finally:
-            os.unlink(temp_file_path) # Ensure cleanup
-			
---------service.py
-
-class SharePointService:
-    """Handles all data retrieval from SharePoint."""
-
-    def __init__(self, config: SharePointConfig, api_client: SharePointAPIClient):  # noqa: D107
-        self.config = config
-        self.api_client = api_client
-
-    def get_documents_by_language(
-        self, libraries: list[str]
-    ) -> dict[str, dict[str, list[dict]]]:
-        """Retrieves documents from specified libraries and groups them by language and source."""
-        logger.info("Grouping documents by their source and language.")
-        grouped_documents = defaultdict(lambda: defaultdict(list))
-
-        for library in libraries:
-            try:
-                documents = self._retrieve_documents_from_library(library)
-                for doc in documents:
-                    language, source = doc.get("Language"), doc.get("Source")
-                    if language and source:
-                        grouped_documents[language][source].append(doc)
-            except (ConnectionError, KeyError, ValueError) as e:
-                logger.error("Error processing library %s: %s", library, e)
-        return grouped_documents
-
-    def get_deleted_file_names(self) -> list[str]:
-        """Retrieves a list of deleted file names from the SharePoint recycle bin."""
-        logger.info("Retrieving deleted file names from SharePoint recycle bin.")
-        try:
-            endpoint = "/_api/site/RecycleBin?$filter=ItemState eq 1"
-            response = self.api_client.send_request(endpoint)
-            deleted_items = response.get("d", {}).get("results", [])
-            return [item.get("Title", "") for item in deleted_items if item.get("Title")]
-        except (ConnectionError, KeyError) as e:
-            logger.error("Failed to retrieve deleted files: %s", e)
-            return []
-
-    def _retrieve_documents_from_library(
-        self, library_name: str
-    ) -> list[dict[str, Any]]:
-        """Retrieves and formats document metadata from a specific SharePoint library."""
-        endpoint = (
-            f"/_api/web/lists/GetByTitle('{library_name}')/items?"
-            "$select=notanumber,source,language,File&$expand=File"
-        )
-        response = self.api_client.send_request(endpoint)
-        items = response.get("d", {}).get("results", [])
-
-        return [
-            {
-                "File": item.get("File", {}),
-                "NotaNumber": item.get("notanumber"),
-                "Source": item.get("source"),
-                "Language": item.get("language"),
-            }
-            for item in items
-        ]
+    # This allows you to run the tests directly from the command line
+    unittest.main(argv=["first-arg-is-ignored"], exit=False, verbosity=2)

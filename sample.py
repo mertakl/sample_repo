@@ -1,343 +1,767 @@
-"""This module provides utilities for connecting Sharepoint."""
-
-import argparse
-import logging
-import os
-import tempfile
-from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
-
-import pandas as pd
-import requests
-from dotenv import load_dotenv
-from msal import ConfidentialClientApplication
-
-from bnppf_rag_engine.config.utils import CONFIGS, get_or_raise_config
-from bnppf_rag_engine.constants.constants import AVAILABLE_LANGUAGES
-from bnppf_rag_engine.cos.bucket_interaction import create_cos_api
-from bnppf_rag_engine.rag_engine.document_parser import DocumentParser
-
-logger = logging.getLogger(__name__)
-
-# Constants
-DEFAULT_CSV_FILENAME = "sharepoint_metadata.csv"
-
-load_dotenv()
+@@In the following code;
+...rest of the code
 
 
-@dataclass
-class SharePointConfig:
-    """Sharepoint config dataclass."""
+async def parse_documents(
+    config_handler: ConfigHandler,
+    language: AVAILABLE_LANGUAGES_TYPE,
+    should_export_label_studio: bool,
+    cos_bucket_api: CosBucketApi,
+    should_write_unparsed_docs: bool,
+    should_add_caption_for_table_blocks: bool,
+    should_add_eureka_url_in_metadata: bool,
+    document_difference_threshold: float,
+    project_name: str,
+) -> dict[str, list[Document]]:
+    """Parses the documents."""
+    parser = DocumentParser(config_handler)
 
-    crt_filepath: str
-    key_filepath: str
-    site_name: str
-    site_base: str = "https://bnpparibas.sharepoint.com"
+    # Parser
+    print(f"*****STARTING PARSING DOCUMENT IN {language}*****")
+    data_source_to_documents = await parser.parse_all_documents_from_cos(
+        cos_folder_path=f"refined/{V_COS_MINOR}/{language}",
+        language=language,
+        cos_bucket_api=cos_bucket_api,
+        should_write_unparsed_docs=should_write_unparsed_docs,
+        document_difference_threshold=document_difference_threshold,
+    )
+    print(f"*****FINISHING PARSING DOCUMENT IN {language}*****")
+
+    # Caption for tables
+    print(f"*****STARTING ADDING CAPTIONS FOR DOCUMENT IN {language}*****")
+    if should_add_caption_for_table_blocks:
+        data_source_to_documents = await add_caption_to_table_blocks(
+            data_source_to_documents=data_source_to_documents,
+            language=language,
+            project_name=project_name,
+        )
+    print(f"*****FINISHING ADDING CAPTIONS FOR DOCUMENT IN {language}*****")
+
+    # URLs for Eureka documents
+    print(f"*****STARTING ADDING URLS FOR DOCUMENT IN {language}*****")
+    if should_add_eureka_url_in_metadata:
+        data_source_to_documents = add_url_in_metadata(data_source_to_documents=data_source_to_documents)
+    print(f"*****FINISHING ADDING URLS FOR DOCUMENT IN {language}*****")
+
+    if should_export_label_studio:
+        export_label_studio_input(data_source_to_documents, project_name, language, config_handler=config_handler)
+
+    return data_source_to_documents
 
 
-@dataclass
-class AzureCredentials:
-    """Azure credientals dataclass."""
+async def parse_documents_and_save_or_read_cached_documents(  # pylint: disable=R0917, R0913
+    config_handler: ConfigHandler,
+    language: AVAILABLE_LANGUAGES_TYPE,
+    should_export_label_studio: bool,
+    cos_bucket_api: CosBucketApi,
+    should_write_unparsed_docs: bool,
+    should_add_caption_for_table_blocks: bool,
+    should_add_eureka_url_in_metadata: bool,
+    document_difference_threshold: float,
+    project_name: str,
+) -> dict[str, list[Document]]:
+    """Parses documents and writes the generated vector DB on the COS."""
+    sources = list(config_handler.get_config("document_parser")["sources"].keys())
+    document_object_cos_folder = config_handler.get_config("document_parser")["document_object_cos_folder"]
+    if should_use_cache_if_exists:
+        data_source_to_documents = read_parsed_documents_from_cos(
+            cos_bucket_api=cos_bucket_api,
+            document_object_cos_folder=document_object_cos_folder,
+            v_cos_patch=V_COS_PATCH,
+            language=language,
+            sources=sources,
+        )
+        if data_source_to_documents is not None:
+            return data_source_to_documents
 
-    client_id: str
-    tenant_id: str
-    authority: str
-    scope: list
-    thumbprint: str
-    client_creds: dict
+    data_source_to_documents = await parse_documents(
+        config_handler=config_handler,
+        language=language,
+        cos_bucket_api=cos_bucket_api,
+        should_write_unparsed_docs=should_write_unparsed_docs,
+        should_add_caption_for_table_blocks=should_add_caption_for_table_blocks,
+        should_export_label_studio=should_export_label_studio,
+        should_add_eureka_url_in_metadata=should_add_eureka_url_in_metadata,
+        document_difference_threshold=document_difference_threshold,
+        project_name=project_name,
+    )
 
-    @classmethod
-    def from_env(cls, tenant_id: str, site_base: str) -> "AzureCredentials":
-        """Create Azure credentials from environment variables."""
-        client_id = os.getenv("AZURE_CLIENT_ID")
-        scope = [f"{site_base}/.default"]
-        authority = f"https://login.microsoftonline.com/{tenant_id}"
-        thumbprint = os.getenv("THUMBPRINT")
+    
+	dump_model_on_cos(
+		cos_bucket_api=cos_bucket_api,
+		data_source_to_documents=data_source_to_documents,
+		cos_folder_path=document_object_cos_folder,
+		v_cos_patch=V_COS_PATCH,
+		language=language,
+		sources=sources,
+		should_overwrite_on_cos=False,
+	)
 
-        client_creds = {}
+    return data_source_to_documents
 
-        return cls(
-            client_id=client_id,
-            tenant_id=tenant_id,
-            authority=authority,
-            scope=scope,
-            thumbprint=thumbprint,
-            client_creds=client_creds,
+
+def create_document_chunks(
+    config_handler: ConfigHandler, data_source_to_documents: dict[str, list[Document]]
+) -> list[DocumentChunk]:
+    splitter = DocumentSplitter(config_handler.get_config("document_splitter"))
+    documents = DocumentParser.concat_documents(document=data_source_to_documents)
+    document_chunks = splitter.split_documents(documents)
+
+    unique_keys = len({chunk.key for chunk in document_chunks})
+    nb_keys = len(document_chunks)
+    if unique_keys != nb_keys:
+        warning_message = f"Duplicate keys found in document chunks: {unique_keys} unique keys for {nb_keys} chunks"
+
+        warnings.warn(warning_message, stacklevel=2)
+
+    return document_chunks
+
+
+async def generate_vector_db(
+    should_export_label_studio: bool,
+    cos_bucket_api: CosBucketApi,
+    config_handler: ConfigHandler,
+    should_write_unparsed_docs: bool,
+    should_add_caption_for_table_blocks: bool,
+    should_add_eureka_url_in_metadata: bool,
+    document_difference_threshold: float,
+    language: str | None = None,
+) -> None:
+    # Language selection
+    assert not (language), "Cannot upload to COS when language is explicitly given."
+    languages = [language] if language else config_handler.get_config("languages")
+
+    for lan in languages:
+        data_source_to_documents: dict[str, list[Document]] = await parse_documents_and_save_or_read_cached_documents(
+            config_handler=config_handler,
+            language=lan,
+            should_export_label_studio=should_export_label_studio,
+            cos_bucket_api=cos_bucket_api,
+            should_write_unparsed_docs=should_write_unparsed_docs,
+            should_add_caption_for_table_blocks=should_add_caption_for_table_blocks,
+            should_add_eureka_url_in_metadata=should_add_eureka_url_in_metadata,
+            document_difference_threshold=document_difference_threshold,
+            project_name=config_handler.get_config("project_name"),
         )
 
+        document_chunks = create_document_chunks(config_handler, data_source_to_documents)
 
-@dataclass
-class DocumentMetadata:
-    """Data class for document metadata."""
+        vector_db = VectorDB(
+            vector_db_config=config_handler.get_config("vector_db"),
+            embedding_model=BNPPFEmbeddings(config_handler.get_config("embedding_model")),
+            language=lan,
+            project_name=config_handler.get_config("project_name"),
+        )
+        vector_db.setup_db_instance()
+        # Important: start the DB from scratch for each language
+        drop_and_resetup_vector_db(vector_db.vector_db_config)
+        await vector_db.from_chunks(document_chunks)
+        
+		await vector_db.to_cos(cos_bucket_api, should_overwrite_on_cos=False)
+        
 
-    file_name: str
-    url: str
-    created_by: str | None
-    last_modified: str
-    nota_number: str | None
-    language: str
-    source: str
+...rest of the code
 
+---document_parser.py
+class DocumentParser:
+    """Class to manage the parsing of the documents."""
 
-@dataclass
-class ProcessedDocument:
-    """Data class for processed document information."""
+    def __init__(self, config_handler: ConfigHandler) -> None:
+        """Initialize the DocumentParser class with a specific configuration.
 
-    file: dict[str, Any]
-    nota_number: str | None
-    source: str
-    language: str
+        Args:
+            config_handler (ConfigHandler): Configuration handler
+        """
+        self.config_handler = config_handler
+        self.parser_config = config_handler.get_config("document_parser")
+        self.data_source_enum = config_handler.get_source_enum()
+        self.document_object_cos_folder = self.parser_config["document_object_cos_folder"]
 
+    async def parse_all_documents_from_cos(
+        self,
+        cos_folder_path: str,
+        language: AVAILABLE_LANGUAGES_TYPE,
+        cos_bucket_api: CosBucketApi,
+        should_write_unparsed_docs: bool,
+        document_difference_threshold: float,
+    ) -> dict[str, list[Document]]:
+        """Parses both KBM et Eureka documents.
 
-class SharePointAuthenticator:
-    """Handles SharePoint authentication logic."""
+        Args:
+            cos_folder_path (str): Path to the COS folder containing the documents
+            language: language of the documents
+            cos_bucket_api: object to interact with the COS
+            should_write_unparsed_docs: bool to know if we should write the file
+            document_difference_threshold: cutoff distance score between 2 documents
 
-    def __init__(self, sp_config: "SharePointConfig", azure_creds: "AzureCredentials"):  # noqa: D107
-        self.config = sp_config
-        self.azure_creds = azure_creds
-        self.azure_creds.client_creds = self._get_client_creds()
-        self._access_token: str | None = None
-
-    def get_access_token(self) -> str:
-        """Get or refresh access token."""
-        if not self._access_token:
-            self._access_token = self._acquire_token()
-        return self._access_token
-
-    def _acquire_token(self) -> str:
-        """Acquire access token from Azure."""
-        proxies = self._get_proxies()
-
-        app = ConfidentialClientApplication(
-            client_id=self.azure_creds.client_id,
-            authority=self.azure_creds.authority,
-            client_credential=self.azure_creds.client_creds,
-            proxies=proxies,
-            verify=False,
+        Returns:
+            A dictionary with the source as keys and the list Documents as values
+        """
+        filepaths_to_ignore: list[str] = get_duplicate_file_candidates_from_cos(
+            output_path=OUTPUTS_PATH,
+            score_threshold=document_difference_threshold,
+            cos_bucket_api=cos_bucket_api,
+            config_handler=self.config_handler,
         )
 
-        token_response = app.acquire_token_for_client(scopes=self.azure_creds.scope)
-
-        if "error" in token_response:
-            raise ValueError(f"Error getting access token: {token_response['error']}")
-
-        return token_response["access_token"]
-
-    @staticmethod
-    def _read_file(file_path: str) -> str:
-        with open(file_path) as f:
-            return f.read()
-
-    def _get_client_creds(self) -> dict:
-        key_data = self._read_file(self.config.key_filepath)
-        public_cert = self._read_file(self.config.crt_filepath)
-        return {
-            "private_key": key_data,
-            "thumbprint": self.azure_creds.thumbprint,
-            "public_certificate": public_cert,
-        }
-
-    @staticmethod
-    def _get_proxies() -> dict[str, str]:
-        """Get proxy configuration."""
-        proxy_url = os.getenv("PROXY")
-        return {"http": proxy_url, "https": proxy_url} if proxy_url else {}
-
-
-class SharePointAPIClient:
-    """Handles SharePoint API communication."""
-
-    def __init__(self, sp_config: "SharePointConfig", authenticator: SharePointAuthenticator):  # noqa: D107
-        self.config = sp_config
-        self.authenticator = authenticator
-
-    def send_request(self, endpoint: str) -> dict[str, Any]:
-        """Send request to SharePoint API."""
-        headers = self._get_headers()
-        url = self._build_url(endpoint)
-
-        try:
-            response = requests.get(
-                url, headers=headers, proxies=self.authenticator._get_proxies(), verify=True, timeout=30
+        document = {}
+        for source in self.parser_config["sources"].keys():
+            document[source] = await self.parse_one_source_from_cos(
+                cos_folder_path=cos_folder_path,
+                source=source,
+                language=language,
+                cos_bucket_api=cos_bucket_api,
+                should_write_unparsed_docs=should_write_unparsed_docs,
+                filepaths_to_ignore=filepaths_to_ignore,
+                project_name=self.config_handler.get_config("project_name"),
             )
-            response.raise_for_status()
-            return response.json()
-        except requests.JSONDecodeError:
-            return {"content": response.content}
-        except requests.RequestException as e:
-            raise ConnectionError(f"Failed to send request to {url}: {e}") from e
 
-    def download_file(self, server_relative_url: str) -> bytes:
-        """Download file content from SharePoint."""
-        endpoint = f"/_api/web/GetFileByServerRelativeUrl('{server_relative_url}')/$Value"
-        headers = self._get_headers()
-        url = self._build_url(endpoint)
+        return document
 
-        response = requests.get(
-            url, headers=headers, proxies=self.authenticator._get_proxies(), verify=True, timeout=30
+    async def parse_one_source_from_cos(
+        self,
+        cos_folder_path: str,
+        project_name: str,
+        source: "self.enum_type",
+        language: AVAILABLE_LANGUAGES_TYPE,
+        cos_bucket_api: CosBucketApi,
+        should_write_unparsed_docs: bool,
+        filepaths_to_ignore: list[str],
+    ) -> list[Document]:
+        """Chooses which type of parsing to use depending on config.
+
+        Args:
+            cos_folder_path (str): Path to the COS folder containing the documents
+            project_name: Project name
+            source: source of the documents
+            language: language of the documents
+            cos_bucket_api: object to interact with the COS
+            should_write_unparsed_docs: bool to know if we should write the file
+            filepaths_to_ignore: list of document paths to ignore
+
+        Returns:
+            list[Document]: A list of parsed documents.
+
+        Raises:
+            ValueError: If the parser type is not supported.
+        """
+        if self.parser_config["type"] == "rag_toolbox":
+            return await self.parse_one_source_from_cos_rag_toolbox(
+                cos_folder_path=cos_folder_path,
+                source=source,
+                language=language,
+                project_name=project_name,
+                cos_bucket_api=cos_bucket_api,
+                should_write_unparsed_docs=should_write_unparsed_docs,
+                filepaths_to_ignore=filepaths_to_ignore,
+            )
+
+        raise ValueError("Unsupported document parser type")
+
+    async def parse_one_source_from_cos_rag_toolbox(  # pylint: disable=R0914
+        self,
+        cos_folder_path: str,
+        source: "self.enum_type",
+        language: AVAILABLE_LANGUAGES_TYPE,
+        project_name: str,
+        cos_bucket_api: CosBucketApi,
+        should_write_unparsed_docs: bool,
+        filepaths_to_ignore: list[str],
+    ) -> list[Document]:
+        """Parses documents from a COS folder.
+
+        Args:
+            cos_folder_path (str): Path to the COS folder containing the documents
+            source: source of the documents
+            language: fr or nl
+            project_name: project_name
+            cos_bucket_api: object to interact with the COS
+            should_write_unparsed_docs: bool to know if we should write the file
+            filepaths_to_ignore: list of document paths to ignore
+
+        Returns:
+            A list of parsed documents.
+
+        Raises:
+            ValueError: If the parser type is not supported.
+        """
+        file_extensions = self.parser_config["sources"][source]
+        parsers_info = [self.parser_config["extension_to_parser_map"][extension] for extension in file_extensions]
+        parsers = [PARSER_NAME_TO_OBJECT[parser_info["name"]](**parser_info["kwargs"]) for parser_info in parsers_info]
+        max_documents_to_parse = self.parser_config.get("max_documents_to_parse", -1)
+        parsed_docs = []
+        unparsable_docs = []
+
+        subfolders = self.parser_config["cos_bucket_subfolder"][source]
+        for parser, subfolder in zip(parsers, subfolders):
+            all_files = cos_bucket_api.list_files_in_bucket_folder(
+                bucket_prefix=(
+                    f"{cos_folder_path}/{source}/{subfolder}" if subfolder else f"{cos_folder_path}/{source}"
+                ),
+                recursive=True,
+            )
+            # Remove some files from all_files because they are too similar to other file
+            all_files = [filepath for filepath in all_files if filepath not in filepaths_to_ignore]
+            if max_documents_to_parse > 0 and len(parsed_docs) < max_documents_to_parse:
+                all_files = all_files[: max_documents_to_parse - len(parsed_docs)]
+            number_of_all_files = len(all_files)
+            for filename in tqdm(all_files, f"Parsing {source} document in {language}"):
+                parsed_file_or_error_msg = await self.parse_one_file_from_cos(
+                    filename=filename,
+                    cos_bucket_api=cos_bucket_api,
+                    parser=parser,
+                    source=source,
+                    language=language,
+                )
+                if isinstance(parsed_file_or_error_msg, Document):
+                    parsed_docs.append(parsed_file_or_error_msg)
+                else:
+                    unparsable_docs.append(parsed_file_or_error_msg)
+
+        if should_write_unparsed_docs and unparsable_docs:
+            self.write_unparsed_docs(
+                unparsable_docs=unparsable_docs, source=source, language=language, project_name=project_name
+            )
+            logger.warning("The parser could not parse %d documents over %d", len(unparsable_docs), number_of_all_files)
+            print(f"The parser could not parse {len(unparsable_docs)} documents over {number_of_all_files}")
+        return parsed_docs
+
+    async def parse_one_file_from_cos(
+        self, filename: str, cos_bucket_api: CosBucketApi, parser: FileParser, source: str, language: str
+    ) -> Document | str:
+        with TemporaryDirectory() as folder:
+            file_path = Path(folder) / Path(filename).name
+            file_path.write_bytes(cos_bucket_api.read_file(cos_filename=filename).read())
+            try:
+                document = await parser.parse_as_document(path=file_path, id=file_path.name)
+                if source == EUREKA:
+                    document = update_titles_and_depths_eureka_nota(
+                        document=document,
+                        titles=get_titles(filepath=str(file_path)),
+                        language=language,
+                    )
+                return document
+            except (ValueError, AssertionError, FormatError) as e:
+                logger.exception(e)
+                logger.error("The parser could not parse document '%s'", file_path.name)
+                print(f"The parser could not parse document '{file_path.name}'")
+                return " because ".join([filename, str(e)])
+
+    @staticmethod
+    def write_unparsed_docs(
+        unparsable_docs: list[str],
+        source: "self.enum_type",
+        language: AVAILABLE_LANGUAGES_TYPE,
+        project_name: str,
+    ) -> None:
+        """Writes unparsed doc file locally."""
+        folder_path = Path(f"/mnt/data/aisc-ap04/{project_name.lower()}")
+        folder_path.mkdir(exist_ok=True, parents=True)
+        with open(folder_path / f"unparsed_docs_{source}_{language}.txt", "w") as outfile:
+            outfile.writelines(language + "\n")
+            outfile.writelines(str(d) + "\n" for d in unparsable_docs)
+
+    @staticmethod
+    def concat_documents(document: dict[str, list[Document]]) -> list[Document]:
+        """Concatenates the list of Documents to have only one list.
+
+        Args:
+            document: {key: kbm or eureka, values: list of documents}
+
+        Returns:
+            The concatenated documents
+        """
+        return [doc for doc_list in document.values() for doc in doc_list]
+
+
+def body_element(filepath: str) -> list[docx.oxml.text.paragraph.CT_P]:
+    """Return body element of a docx filepath used to get xml."""
+    return docx.Document(filepath)._body._body.xpath(".//w:p")  # pylint: disable=W0212
+
+
+def depth_from_xml(xml: str) -> int | None:
+    """Get depth from XML.
+
+    Args:
+        xml: XmlString object of the body element
+
+    Returns:
+        depth if any or None
+    """
+    if '<w:pStyle w:val="Heading"/>' in xml or '<w:pStyle w:val="Subtitle"/>' in xml:  # main titles
+        return 0
+    match_depth = re.search(r'<w:pStyle w:val="Contents([1-9]\d*)"', xml)  # depth
+    if match_depth and "__RefHeading___Toc" in xml:  # text in ToC
+        return int(match_depth.group(1))
+    return None  # not main titles nor ToC
+
+
+def get_titles(filepath: str) -> dict[str, int]:
+    """Extracts the titles of the document.
+
+    The document 'main' title will have depth=0.
+
+    Args:
+        filepath: the local path to the documents
+
+    Returns:
+        titles with key title and value depth
+    """
+    titles = {}
+    for item in body_element(filepath=filepath):
+        title_depth = depth_from_xml(str(item.xml))
+        if isinstance(title_depth, int) and item.text.split("\t")[0].strip():
+            titles[item.text.split("\t")[0].strip()] = title_depth
+    return titles
+
+
+def return_document_or_raise(
+    document: Document, failure_cause: str, should_keep_not_formatted_document: bool
+) -> Document | None:
+    """Returns document if we want to else raise error that will be caught in the try except."""
+    if should_keep_not_formatted_document:
+        return document
+    raise FormatError(failure_cause)
+
+
+def update_titles_and_depths_eureka_nota(
+    document: Document,
+    titles: dict[str, int],
+    language: AVAILABLE_LANGUAGES_TYPE,
+    should_keep_not_formatted_document: bool = SHOULD_KEEP_NOT_FORMATTED_DOCUMENTS,
+) -> Document:
+    blocks = []
+    main_title = ""
+    main_subtitle = ""
+    table_of_content_found = False
+
+    if len(titles) == 0:
+        return return_document_or_raise(
+            document=document,
+            failure_cause=f"0 titles found: {document.id}",
+            should_keep_not_formatted_document=should_keep_not_formatted_document,
         )
-        response.raise_for_status()
-        return response.content
+    if max(titles.values()) == 0:
+        return return_document_or_raise(
+            document=document,
+            failure_cause=f"No TOC: {document.id}",
+            should_keep_not_formatted_document=should_keep_not_formatted_document,
+        )
 
-    def _get_headers(self) -> dict[str, str]:
-        """Get request headers with authentication."""
-        return {
-            "Authorization": f"Bearer {self.authenticator.get_access_token()}",
-            "Accept": "application/json;odata=verbose",
-            "Content-Type": "application/json;odata=verbose",
-        }
+    for block in document.blocks:
+        is_text_in_block = hasattr(block, "text")
 
-    def _build_url(self, endpoint: str) -> str:
-        """Build complete URL for API endpoint."""
-        clean_endpoint = endpoint.lstrip("/")
-        return f"{self.config.site_base}/sites/{self.config.site_name}/{clean_endpoint}"
+        if not is_text_in_block:  # TableBlock -> add a TextBlock instead to use caption
+            text_metadata = deepcopy(block.metadata)
+            del text_metadata["caption"]
+            text_metadata["is_llm_generated"] = True
+            text_metadata["main_title"] = main_title
+            text_metadata["main_subtitle"] = main_subtitle
+            blocks.append(  # add new TextBlock to use caption in generation
+                TextBlock(
+                    hyperlinks=block.hyperlinks,
+                    page=block.page,
+                    faq_id=block.faq_id,
+                    faq_role=block.faq_role,
+                    metadata=text_metadata,
+                    block_type="TextBlock",
+                    text=block.metadata.get("caption", "Caption was not generated properly. Do not use this source."),
+                )
+            )
+            block.metadata["main_title"] = main_title
+            block.metadata["main_subtitle"] = main_subtitle
+            block.metadata["is_llm_generated"] = False
+            blocks.append(block)  # keep TableBlock
+            continue
+
+        stripped_text = block.text.strip()
+        # if depth = 0 (document general title), we remove the chunk and add title in all chunk metadata
+        if titles.get(stripped_text, -1) == 0:
+            main_title, main_subtitle = update_document_titles(
+                main_title=main_title, main_subtitle=main_subtitle, stripped_text=stripped_text, document_id=document.id
+            )
+            del titles[stripped_text]
+        # remove block with the string "table of content"
+        elif stripped_text.lower() in TABLE_OF_CONTENT[language]:
+            table_of_content_found = True
+        # it's a Textblock, TitleBlock, ListItem or CodeBlock
+        elif stripped_text in titles:  # title is found -> transform to TitleBlock and update depth
+            block.metadata["main_title"] = main_title
+            block.metadata["main_subtitle"] = main_subtitle
+            block.metadata["is_llm_generated"] = False
+            blocks.append(
+                TitleBlock(
+                    hyperlinks=block.hyperlinks,
+                    page=block.page,
+                    faq_id=block.faq_id,
+                    faq_role=block.faq_role,
+                    metadata=block.metadata,
+                    block_type="TitleBlock",
+                    text=block.text,
+                    depth=titles[stripped_text],
+                )
+            )
+            del titles[stripped_text]
+        # no title found -> transform TitleBlock to TextBlock (as only titles should be TitleBlock)
+        elif block.block_type == "TitleBlock":
+            block.metadata["main_title"] = main_title
+            block.metadata["main_subtitle"] = main_subtitle
+            block.metadata["is_llm_generated"] = False
+            blocks.append(
+                TextBlock(
+                    hyperlinks=block.hyperlinks,
+                    page=block.page,
+                    faq_id=block.faq_id,
+                    faq_role=block.faq_role,
+                    metadata=block.metadata,
+                    block_type="TextBlock",
+                    text=stripped_text,
+                )
+            )
+        else:  # keep Textblock, ListItem or CodeBlock and update the title
+            block.metadata["main_title"] = main_title
+            block.metadata["main_subtitle"] = main_subtitle
+            block.metadata["is_llm_generated"] = False
+            blocks.append(block)
+
+    validation_output = validate_document_format(
+        document=document,
+        blocks=blocks,
+        titles=titles,
+        main_title=main_title,
+        main_subtitle=main_subtitle,
+        table_of_content_found=table_of_content_found,
+        should_keep_not_formatted_document=should_keep_not_formatted_document,
+    )
+
+    return validation_output or Document(
+        blocks=blocks,
+        id=document.id,
+        filename=document.filename,
+        metadata=document.metadata,
+    )
 
 
-class DocumentFilter:
-    """Handles document filtering logic."""
+def validate_document_format(
+    document: Document,
+    blocks: list[Block],
+    titles: dict[str, int],
+    main_title: str,
+    main_subtitle: str,
+    table_of_content_found: bool,
+    should_keep_not_formatted_document: bool,
+) -> Document | None:
+    """Validates (and returns if needed) document.
 
-    PARSEABLE_EXTENSIONS = {".doc", ".docx"}  # noqa: RUF012
+    Args:
+        document: Parsed Document from Eureka
+        blocks: updated blocks from the document
+        titles: dict of titles to their depth
+        main_title: main title of the document
+        main_subtitle: main_subtitle of the document
+        table_of_content_found: True if the string "table of content" was found
+        should_keep_not_formatted_document: True to keep wrongly formatted document without updating them
 
-    @staticmethod
-    def is_parseable(file_name: str) -> bool:
-        """Check if document is parseable."""
-        _, extension = os.path.splitext(file_name)
-        return extension.lower() in DocumentFilter.PARSEABLE_EXTENSIONS
+    Return:
+        - if should_keep_not_formatted_document is True:
+            - Validation failed: original document
+            - All validation passed: None
+        - if should_keep_not_formatted_document is False:
+            - Validation failed: raise FormatError that will be caught in the except
+            - All validation passed: None
+    """
+    if not table_of_content_found:
+        return return_document_or_raise(
+            document=document,
+            failure_cause=f"Table of content not found: {document.id}",
+            should_keep_not_formatted_document=should_keep_not_formatted_document,
+        )
 
-    @staticmethod
-    def is_recently_modified(last_modified_str: str, hours: int = 24) -> bool:
-        """Check if document was modified within specified hours."""
+    # validate all blocks have the same main_title and main_subtitle
+    for block in blocks:
+        if block.metadata["main_title"] != main_title:
+            return return_document_or_raise(
+                document=document,
+                failure_cause=f"Not all blocks have the same main_title in {document.id}."
+                "This means a document main title is missplaced.",
+                should_keep_not_formatted_document=should_keep_not_formatted_document,
+            )
+        if block.metadata["main_subtitle"] != main_subtitle:
+            return return_document_or_raise(
+                document=document,
+                failure_cause=f"Not all blocks have the same main_subtitle in {document.id}."
+                "This means a document main title is missplaced.",
+                should_keep_not_formatted_document=should_keep_not_formatted_document,
+            )
+
+    # validate all titles were found
+    if len(titles) != 0:
+        return return_document_or_raise(
+            document=document,
+            failure_cause=f"Titles not found in {document.id}: {titles}",
+            should_keep_not_formatted_document=should_keep_not_formatted_document,
+        )
+    return None
+
+
+def update_document_titles(
+    main_title: str, main_subtitle: str, stripped_text: str, document_id: str
+) -> tuple[str, str]:
+    """Updates document main title and main subtitles."""
+    if not main_title:
+        main_title = stripped_text
+    elif not main_subtitle:
+        main_subtitle = stripped_text
+    else:
+        raise ValueError(
+            f"Main title {main_title} and main subtitle {main_subtitle} already found for document {document_id}."
+        )
+    return main_title, main_subtitle
+
+	
+
+## generate_vector_db is the main function to run. Which retrieves documents from ibm cos and saves to vector db.
+##I need to do same in this code except I only need to save the new files to vector db 
+##Here is the code that I am working on;
+------client.py
+class SharePointClient:
+    """Main SharePoint client class."""
+
+    def __init__(self, sp_config: SharePointConfig):  # noqa: D107
+        self.config = sp_config
+        self.cos_api = self._create_cos_api()
+
+        # Initialize components
+        self.azure_creds = self._initialize_azure_credentials()
+        self.authenticator = SharePointAuthenticator(sp_config, self.azure_creds)
+        self.api_client = SharePointAPIClient(sp_config, self.authenticator)
+        self.metadata_manager = MetadataManager(self.cos_api)
+        self.document_processor = DocumentProcessor(self.api_client, self.cos_api, self.metadata_manager)
+
+    def run(self, project_args) -> None:
+        """Main execution method."""
+        config_handler = self._get_config_handler(project_args.project_name)
+        languages = self._get_languages(project_args, config_handler)
+
+        # Handle deleted files
+        self._process_deleted_files()
+
+        # Process documents by language
+        grouped_documents = self._get_grouped_documents(["Documents"])
+
+        for language in languages:
+            documents = grouped_documents.get(language, {})
+            self._process_documents_by_language(documents, project_args)
+
+    def _process_deleted_files(self) -> None:
+        """Process deleted files from recycle bin."""
         try:
-            last_modified = DocumentFilter._parse_datetime(last_modified_str)
-            current_time = datetime.now(timezone.utc)
-            time_difference = current_time - last_modified
-            return time_difference < timedelta(hours=hours)
-        except (ValueError, TypeError):
-            return False
+            logger.info("Retrieving deleted files from sharepoint.")
+            deleted_files = self._get_deleted_file_names()
+            for file_name in deleted_files:
+                self.document_processor.delete_document(file_name=file_name)
+        except (ConnectionError, ValueError, KeyError) as e:
+            logger.error("Failed to process deleted files: %s", e)
 
-    @staticmethod
-    def _parse_datetime(datetime_str: str) -> datetime:
-        """Parse datetime string to datetime object."""
-        if datetime_str.endswith("Z"):
-            datetime_str = datetime_str[:-1] + "+00:00"
-        return datetime.fromisoformat(datetime_str)
+    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args) -> None:
+        """Process documents grouped by source for a specific language."""
+        for source, doc_list in documents_by_source.items():
+            for doc_data in doc_list:
+                doc = ProcessedDocument(
+                    file=doc_data["File"],
+                    nota_number=doc_data.get("NotaNumber"),
+                    source=source,
+                    language=doc_data.get("Language", ""),
+                )
+                self.document_processor.process_document(doc=doc, parsed_args=doc_args)
 
+    def _get_grouped_documents(self, libraries: list[str]) -> dict[str, dict[str, list[dict]]]:
+        """Get documents grouped by language and source."""
+        logger.info("Grouping documents by their source and language.")
 
-class MetadataManager:
-    """Manages CSV metadata operations."""
+        grouped_documents = defaultdict(lambda: defaultdict(list))
 
-    def __init__(self, cos_api, csv_file_name: str = DEFAULT_CSV_FILENAME):  # noqa: D107
-        self.cos_api = cos_api
-        self.csv_file_name = csv_file_name
+        for library in libraries:
+            try:
+			##Retrieve documents from sharepoint
+                documents = self._retrieve_documents_from_library(library)
+                for doc in documents:
+                    language, source = doc["Language"], doc["Source"]
+                    if language and source:
+                        grouped_documents[language][source].append(doc)
+            except (ConnectionError, KeyError, ValueError) as e:
+                logger.error("Error processing library %s: %s", library, e)
+                continue
 
-    def get_metadata_by_filename(self, csv_path: str, file_name: str) -> dict[str, Any] | None:
-        """Get metadata for specific file."""
-        if not self.cos_api.file_exists(csv_path):
-            return None
-
-        try:
-            df = self.cos_api.read_csv(csv_path, sep=";")
-            filtered_df = df[df["file_name"] == file_name]
-            return filtered_df.iloc[0].to_dict() if not filtered_df.empty else None
-        except (pd.errors.EmptyDataError, KeyError, IndexError):
-            return None
-
-    def write_metadata(self, metadata: DocumentMetadata, csv_path: str) -> None:
-        """Write metadata to CSV file."""
-        try:
-            if self.cos_api.file_exists(csv_path):
-                existing_df = self.cos_api.read_csv(csv_path, sep=";")
-            else:
-                existing_df = self._create_empty_dataframe()
-
-            new_entry = pd.DataFrame([metadata.__dict__])
-            updated_df = self._merge_metadata(existing_df, new_entry)
-
-            self.cos_api.df_to_csv(df=updated_df, cos_filename=csv_path, header=True)
-
-        except (OSError, pd.errors.ParserError) as e:
-            raise OSError(f"Failed to write metadata to {csv_path}: {e}") from e
-
-    def remove_metadata(self, csv_path: str, file_name: str) -> None:
-        """Remove metadata for specific file."""
-        if not self.cos_api.file_exists(csv_path):
-            return
-
-        try:
-            df = self.cos_api.read_csv(csv_path, sep=";")
-            updated_df = df[df["file_name"] != file_name]
-
-            if not updated_df.empty:
-                self.cos_api.df_to_csv(df=updated_df, cos_filename=csv_path, header=True)
-
-        except (OSError, pd.errors.ParserError) as e:
-            raise OSError(f"Failed to remove metadata from {csv_path}: {e}") from e
-
-    @staticmethod
-    def _create_empty_dataframe() -> pd.DataFrame:
-        """Create empty DataFrame with proper columns."""
-        columns = ["file_name", "url", "created_by", "last_modified", "nota_number", "language", "source"]
-        return pd.DataFrame(columns=columns)
-
-    @staticmethod
-    def _merge_metadata(existing_df: pd.DataFrame, new_entry: pd.DataFrame) -> pd.DataFrame:
-        """Merge new metadata entry with existing data."""
-        unique_cols = ["file_name", "source"]
-        mask = existing_df[unique_cols].eq(new_entry[unique_cols].iloc[0]).all(axis=1)
-
-        if not existing_df[mask].empty:
-            existing_df.update(new_entry)
-            return existing_df
-        else:
-            return pd.concat([existing_df, new_entry], ignore_index=True)
+        return grouped_documents
+        ]
 
 
-class DocumentProcessor:
+	..rest 
+
+---document_processor.py
+	
+	class DocumentProcessor:
     """Processes SharePoint documents."""
 
-    def __init__(self, api_client: SharePointAPIClient, cos_api, metadata_manager: MetadataManager):  # noqa: D107
+    def __init__(  # noqa: D107
+        self, api_client: SharePointAPIClient, cos_api: CosBucketApi, metadata_manager: MetadataManager
+    ):
         self.api_client = api_client
         self.cos_api = cos_api
         self.metadata_manager = metadata_manager
+        self.path_manager = PathManager()
 
-    def process_document(self, doc: ProcessedDocument, cos_folder_path: Path) -> None:
+    def process_document(self, doc: ProcessedDocument, parsed_args) -> None:
         """Process a single document."""
         file_info = doc.file
-        file_name = file_info.get("Name", "")
+        file_name, last_modified, source, language = (
+            file_info["Name"],
+            file_info["TimeLastModified"],
+            file_info["Source"],
+            file_info["Language"],
+        )
+
+        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
 
         if not DocumentFilter.is_parseable(file_name):
-            self._log_unparseable_document(file_name, doc)
+            self._log_unparseable_document(file_name, doc, parsed_args)
             return
 
-        last_modified = file_info.get("TimeLastModified", "")
         if not DocumentFilter.is_recently_modified(last_modified):
+            if not self.cos_api.file_exists(file_path):
+                # TODO: If the file does not exist already
+                self._upload_document(doc, file_path)
             return
+        self._upload_document(doc, file_path)
 
-        self._upload_document(doc, cos_folder_path)
-
-    def delete_document(self, file_name: str, cos_folder_path: Path) -> None:
+    def delete_document(self, file_name: str) -> None:
         """Delete document from COS and update metadata."""
-        csv_path = str(cos_folder_path / DEFAULT_CSV_FILENAME)
-        metadata = self.metadata_manager.get_metadata_by_filename(csv_path, file_name)
+        metadata_path = self.path_manager.get_metadata_path()
 
-        if not metadata:
+        deleted_doc_metadata = self.metadata_manager.get_metadata_by_filename(
+            file_name=file_name, metadata_path=metadata_path
+        )
+
+        if not deleted_doc_metadata:
+            # Nothing to delete
             return
 
         # Delete file from COS
-        file_path = cos_folder_path / metadata["source"] / metadata["language"] / file_name
+        source, language = deleted_doc_metadata["source"], deleted_doc_metadata["language"]
+        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
+        logger.info("Deleting file %s", file_name)
         self.cos_api.delete_file(str(file_path))
 
         # Remove from metadata
-        self.metadata_manager.remove_metadata(csv_path, file_name)
+        self.metadata_manager.remove_metadata(metadata_path=metadata_path, file_name=file_name)
 
-    def _upload_document(self, doc: ProcessedDocument, cos_folder_path: Path) -> None:
+    def _upload_document(self, doc: ProcessedDocument, document_path: str) -> None:
         """Upload document to COS and save metadata."""
         file_info = doc.file
-        file_name = file_info["Name"]
-        server_relative_url = file_info["ServerRelativeUrl"]
+        file_name, server_relative_url = file_info["Name"], file_info["ServerRelativeUrl"]
+
+        logger.info("Downloading document %s from sharepoint...", file_name)
 
         # Download file content
         file_content = self.api_client.download_file(server_relative_url)
@@ -348,9 +772,9 @@ class DocumentProcessor:
             temp_file_path = temp_file.name
 
         try:
+            logger.info("Uploading document %s to COS...", file_name)
             # Upload to COS
-            destination_path = cos_folder_path / doc.source / doc.language / file_name
-            self.cos_api.upload_file(temp_file_path, str(destination_path))
+            self.cos_api.upload_file(temp_file_path, document_path)
 
             # Save metadata
             metadata = DocumentMetadata(
@@ -363,191 +787,23 @@ class DocumentProcessor:
                 source=doc.source,
             )
 
-            csv_path = str(cos_folder_path / DEFAULT_CSV_FILENAME)
-            self.metadata_manager.write_metadata(metadata, csv_path)
+            metadata_path = self.path_manager.get_metadata_path()
+            self.metadata_manager.write_metadata(metadata, metadata_path)
 
         finally:
             # Clean up temporary file
             os.unlink(temp_file_path)
 
-    def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument, parsed_args) -> None:
+    def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument, p_args) -> None:
         """Log unparseable document."""
         DocumentParser.write_unparsed_docs(
             unparsable_docs=[file_name],
             source=doc.source,
             language=doc.language,
-            project_name=parsed_args.project_name,
+            project_name=p_args.project_name,
         )
 
         _, extension = os.path.splitext(file_name)
         logger.error("Files with extension '%s' are not supported", extension)
-
-
-class SharePointClient:
-    """Main SharePoint client class."""
-
-    def __init__(self, sp_config: "SharePointConfig"):  # noqa: D107
-        self.config = sp_config
-        self.cos_api = self._create_cos_api()
-
-        # Initialize components
-        self.azure_creds = self._initialize_azure_credentials()
-        self.authenticator = SharePointAuthenticator(sp_config, self.azure_creds)
-        self.api_client = SharePointAPIClient(sp_config, self.authenticator)
-        self.metadata_manager = MetadataManager(self.cos_api)
-        self.document_processor = DocumentProcessor(self.api_client, self.cos_api, self.metadata_manager)
-
-    def run(self, parsed_args) -> None:
-        """Main execution method."""
-        config_handler = self._get_config_handler(parsed_args.project_name)
-        languages = self._get_languages(parsed_args, config_handler)
-        cos_folder_path = Path(config_handler.get_config("document_parser")["document_object_cos_folder"])
-
-        # Handle deleted files
-        self._process_deleted_files(cos_folder_path)
-
-        # Process documents by language
-        grouped_documents = self._get_grouped_documents(["Documents"])
-
-        for language in languages:
-            documents = grouped_documents.get(language, {})
-            self._process_documents_by_language(documents, cos_folder_path, parsed_args)
-
-    def _process_deleted_files(self, cos_folder_path: Path) -> None:
-        """Process deleted files from recycle bin."""
-        try:
-            deleted_files = self._get_deleted_file_names()
-            for file_name in deleted_files:
-                self.document_processor.delete_document(file_name, cos_folder_path)
-        except (ConnectionError, ValueError, KeyError) as e:
-            logger.error("Failed to process deleted files: %s", e)
-
-    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], cos_folder_path: Path, parsed_args) -> None:
-        """Process documents grouped by source for a specific language."""
-        for source, doc_list in documents_by_source.items():
-            for doc_data in doc_list:
-                doc = ProcessedDocument(
-                    file=doc_data["File"],
-                    nota_number=doc_data.get("NotaNumber"),
-                    source=source,
-                    language=doc_data.get("Language", ""),
-                )
-                self.document_processor.process_document(doc, cos_folder_path)
-
-    def _get_grouped_documents(self, libraries: list[str]) -> dict[str, dict[str, list[dict]]]:
-        """Get documents grouped by language and source."""
-        grouped_documents = defaultdict(lambda: defaultdict(list))
-
-        for library in libraries:
-            try:
-                documents = self._retrieve_documents_from_library(library)
-                for doc in documents:
-                    language = doc.get("Language")
-                    source = doc.get("Source")
-                    if language and source:
-                        grouped_documents[language][source].append(doc)
-            except (ConnectionError, KeyError, ValueError) as e:
-                logger.error("Error processing library %s: %s", library, e)
-                continue
-
-        return grouped_documents
-
-    def _retrieve_documents_from_library(self, library_name: str) -> list[dict[str, Any]]:
-        """Retrieve documents from specific SharePoint library."""
-        endpoint = f"/_api/web/lists/GetByTitle('{library_name}')/items?$select=*&$expand=File"
-        response = self.api_client.send_request(endpoint)
-
-        items = response.get("d", {}).get("results", [])
-        return [
-            {
-                "File": item.get("File", {}),
-                "NotaNumber": item.get("notanumber"),
-                "Source": item.get("source"),
-                "Language": item.get("language"),
-            }
-            for item in items
-        ]
-
-    def _get_deleted_file_names(self) -> list[str]:
-        """Get list of deleted file names from recycle bin."""
-        try:
-            response = self.api_client.send_request("/_api/site/RecycleBin?$filter=ItemState eq 1")
-            deleted_documents = response.get("d", {}).get("results", [])
-            return [doc.get("Title", "") for doc in deleted_documents if doc.get("Title")]
-        except (ConnectionError, KeyError):
-            return []
-
-    def _initialize_azure_credentials(self) -> "AzureCredentials":
-        """Initialize Azure credentials."""
-        tenant_id = os.getenv("AZURE_TENANT_ID")
-        if not tenant_id:
-            raise ValueError("AZURE_TENANT_ID environment variable is required")
-
-        return AzureCredentials.from_env(tenant_id, self.config.site_base)
-
-    @staticmethod
-    def _create_cos_api():
-        """Create COS API instance."""
-        return create_cos_api()
-
-    @staticmethod
-    def _get_config_handler(project_name: str):
-        """Get configuration handler."""
-        return get_or_raise_config(project_name)
-
-    @staticmethod
-    def _get_languages(parsed_args, config_handler) -> list[str]:
-        """Get list of languages to process."""
-        if hasattr(parsed_args, "language") and parsed_args.language:
-            return [parsed_args.language]
-        return config_handler.get_config("languages")
-
-
-def commandline_parser() -> argparse.ArgumentParser:
-    """CMD parser."""
-    parser = argparse.ArgumentParser(
-        "Retrieve sharepoint documents",
-        description="The command to retrieve documents from sharepoint and upload to COS",
-    )
-
-    parser.add_argument(
-        "--language",
-        type=str,
-        default=None,
-        choices=AVAILABLE_LANGUAGES,
-        help="Specific language you want to test the DB with. Default use all languages.",
-    )
-
-    parser.add_argument(
-        "--project_name",
-        type=str,
-        choices=CONFIGS,
-        help="Name of the project.Used for configuration and path purposes.",
-    )
-
-    return parser
-
-
-if __name__ == "__main__":
-    parsed_args = commandline_parser().parse_args()
-
-    # Initialize the SharePointClient
-    crt_content = os.getenv("SHAREPOINT_TLS_CERTIFICATE").replace("\\n", "\n")
-    key_content = os.getenv("SHAREPOINT_TLS_KEY").replace("\\n", "\n")
-
-    with tempfile.NamedTemporaryFile("w", suffix=".crt", delete=False) as crt_file:
-        crt_file.write(crt_content)
-        crt_path = crt_file.name
-
-    with tempfile.NamedTemporaryFile("w", suffix=".key", delete=False) as key_file:
-        key_file.write(key_content)
-        key_path = key_file.name
-
-    sharepoint_config = SharePointConfig(crt_filepath=crt_path, key_filepath=key_path, site_name="EurekaTestSite")
-
-    sharepoint_client = SharePointClient(sharepoint_config)
-
-    sharepoint_client.run(parsed_args=parsed_args)
-
-    os.unlink(key_path)
-    os.unlink(crt_path)
+		
+##So basically, I need you to save the files which are supposed to upload to COS. 

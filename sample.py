@@ -14,7 +14,7 @@ class SharePointClient:
         self.parser = None
 
         # Track processed documents for vector DB updates
-        # Now stores both the ProcessedDocument and the file content
+        # Stores ProcessedDocument and original doc_data with SharePoint File object
         self.newly_uploaded_documents = defaultdict(list)
 
     async def run(self, project_args) -> None:
@@ -51,7 +51,7 @@ class SharePointClient:
         except (ConnectionError, ValueError, KeyError) as e:
             logger.error("Failed to process deleted files: %s", e)
 
-    async def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args) -> None:
+    async     async def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args) -> None:
         """Process documents grouped by source for a specific language."""
         for source, doc_list in documents_by_source.items():
             for doc_data in doc_list:
@@ -63,17 +63,14 @@ class SharePointClient:
                     language=language,
                 )
                 
-                # Process document and get both upload status and file content
-                upload_result = await self.document_processor.process_document_with_content(
-                    doc=doc, parsed_args=doc_args
-                )
+                # Process document normally
+                was_uploaded = self.document_processor.process_document(doc=doc, parsed_args=doc_args)
                 
-                # Track if document was newly uploaded along with its content
-                if upload_result["was_uploaded"]:
+                # Track if document was newly uploaded along with the original doc_data
+                if was_uploaded:
                     self.newly_uploaded_documents[language].append({
                         "doc": doc,
-                        "file_content": upload_result["file_content"],
-                        "file_path": upload_result["file_path"]  # Local path where file was downloaded
+                        "doc_data": doc_data  # Keep the original doc_data with File object
                     })
 
     def _get_grouped_documents(self, libraries: list[str]) -> dict[str, dict[str, list[dict]]]:
@@ -137,7 +134,7 @@ class SharePointClient:
         )
 
         try:
-            # Parse the newly uploaded documents using their cached content
+            # Parse the newly uploaded documents using SharePoint File objects
             data_source_to_documents = await self._parse_new_documents_from_cache(
                 language=language, config_handler=config_handler, project_args=project_args
             )
@@ -202,7 +199,7 @@ class SharePointClient:
     async def _parse_new_documents_from_cache(
         self, language: str, config_handler: ConfigHandler, project_args
     ) -> dict[str, list[Document]]:
-        """Parse newly uploaded documents using their cached file content."""
+        """Parse newly uploaded documents using SharePoint File objects."""
         # Create a temporary mapping of newly uploaded documents by source
         new_docs_by_source = defaultdict(list)
         for doc_info in self.newly_uploaded_documents[language]:
@@ -217,12 +214,13 @@ class SharePointClient:
 
             for doc_info in doc_infos:
                 doc = doc_info["doc"]
+                doc_data = doc_info["doc_data"]
                 file_name = doc.file["Name"]
 
                 try:
-                    # Parse document using the cached file path (no COS download needed)
-                    parsed_doc = await self._parse_document_from_local_path(
-                        file_path=doc_info["file_path"],
+                    # Parse document using SharePoint File object
+                    parsed_doc = await self._parse_document_from_sharepoint_file(
+                        sharepoint_file=doc_data["File"],
                         source=source,
                         language=language
                     )
@@ -246,16 +244,23 @@ class SharePointClient:
 
         return data_source_to_documents
 
-    async def _parse_document_from_local_path(self, file_path: str, source: str, language: str) -> Document | None:
-        """Parse a single document from local file path."""
+    async def _parse_document_from_sharepoint_file(self, sharepoint_file: dict, source: str, language: str) -> Document | None:
+        """Parse a single document directly from SharePoint File object using temporary file."""
         from pathlib import Path
+        from tempfile import NamedTemporaryFile
+        import os
+
+        file_name = sharepoint_file.get("Name", "")
+        if not file_name:
+            logger.warning("SharePoint file has no name")
+            return None
 
         # Get the appropriate parser for this source
         parser_config = self.parser.parser_config
         file_extensions = parser_config["sources"][source]
 
         # Determine file extension (without dot)
-        file_extension = Path(file_path).suffix[1:].lower()
+        file_extension = Path(file_name).suffix[1:].lower()
         if file_extension not in file_extensions:
             logger.warning(f"File extension {file_extension} not supported for source {source}")
             return None
@@ -264,22 +269,46 @@ class SharePointClient:
         parser_info = parser_config["extension_to_parser_map"][file_extension]
         file_parser = PARSER_NAME_TO_OBJECT[parser_info["name"]](**parser_info["kwargs"])
 
+        # Get the file download URL from SharePoint
+        server_relative_url = sharepoint_file.get("ServerRelativeUrl")
+        if not server_relative_url:
+            logger.error(f"No ServerRelativeUrl found for file {file_name}")
+            return None
+
         try:
-            # Parse the document directly from the local path
-            document = await file_parser.parse_as_document(path=Path(file_path), id=Path(file_path).name)
+            # Download file content from SharePoint
+            file_endpoint = f"/_api/web/GetFileByServerRelativeUrl('{server_relative_url}')/$value"
+            file_content = self.api_client.send_request(endpoint=file_endpoint, return_raw=True)
 
-            # Apply Eureka-specific processing if needed
-            if source == EUREKA:
-                document = self.parser.update_titles_and_depths_eureka_nota(
-                    document=document,
-                    titles=self.parser.get_titles(filepath=file_path),
-                    language=language,
-                )
+            # Create temporary file with correct extension
+            suffix = f".{file_extension}"
+            with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(file_content)
+                temp_file_path = Path(temp_file.name)
 
-            return document
+            try:
+                # Parse the document from temporary file
+                document = await file_parser.parse_as_document(path=temp_file_path, id=file_name)
+
+                # Apply Eureka-specific processing if needed
+                if source == EUREKA:
+                    document = self.parser.update_titles_and_depths_eureka_nota(
+                        document=document,
+                        titles=self.parser.get_titles(filepath=str(temp_file_path)),
+                        language=language,
+                    )
+
+                return document
+
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file_path)
+                except OSError:
+                    logger.warning(f"Failed to delete temporary file {temp_file_path}")
 
         except Exception as e:
-            logger.error(f"Failed to parse document {file_path}: {e}")
+            logger.error(f"Failed to parse document {file_name}: {e}")
             return None
 
     @staticmethod

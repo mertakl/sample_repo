@@ -1,128 +1,179 @@
-import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
-import asyncio
+##Can you also fix these unit tests?
+from unittest.mock import Mock, patch
 
-# Assuming these imports are available in the test environment
-from orchestrator import SharePointOrchestrator, ProcessedDocument
-from project_args import ProjectArgs
+import pytest
+import requests
+
+from bnppf_rag_engine.rag_engine.sharepoint.api_client import (
+    SharePointAPIClient,
+)
+from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
+    SharePointConfig,
+)
 
 
-class TestSharePointOrchestratorFunctional(unittest.TestCase):
-    """
-    Functional tests for the SharePointOrchestrator class.
-    Mocks external services to test the orchestration logic.
-    """
+class TestSharePointAPIClient:
+    """Test SharePointAPIClient class."""
 
-    def setUp(self):
-        """Set up mock dependencies and the orchestrator instance for each test."""
-        self.mock_sp_service = MagicMock()
-        self.mock_doc_processor = MagicMock()
-        # AsyncMock is used for methods that are async, like run() and update_for_language()
-        self.mock_db_manager = AsyncMock()
-        self.mock_config_handler = MagicMock()
-
-        # Instantiate the orchestrator with the mocked dependencies
-        self.orchestrator = SharePointOrchestrator(
-            sharepoint_service=self.mock_sp_service,
-            document_processor=self.mock_doc_processor,
-            vector_db_manager=self.mock_db_manager,
-            config_handler=self.mock_config_handler,
+    @pytest.fixture
+    def mock_config(self):
+        """Create mock SharePoint config."""
+        return SharePointConfig(
+            crt_filepath="/path/to/cert.crt", key_filepath="/path/to/key.key", site_name="test_site"
         )
 
-        # Mock the project arguments object
-        self.mock_project_args = MagicMock(spec=ProjectArgs)
-        self.mock_project_args.project_name = "test_project"
-        self.mock_project_args.language = None  # No language filter by default
+    @pytest.fixture
+    def mock_authenticator(self):
+        """Create mock authenticator."""
+        authenticator = Mock()
+        authenticator.get_access_token.return_value = "test_token"
+        authenticator.get_proxies.return_value = {}
+        return authenticator
 
-    def tearDown(self):
-        """Clean up mocks after each test."""
-        self.mock_sp_service.reset_mock()
-        self.mock_doc_processor.reset_mock()
-        self.mock_db_manager.reset_mock()
-        self.mock_config_handler.reset_mock()
+    def test_build_url(self, mock_config, mock_authenticator):
+        """Test URL building."""
+        client = SharePointAPIClient(mock_config, mock_authenticator)
 
-    async def test_run_with_new_documents(self):
-        """Test the orchestrator when new documents are available."""
-        # 1. Mock the SharePoint service to return no deleted files and some new documents
-        self.mock_sp_service.get_deleted_file_names.return_value = []
-        self.mock_sp_service.get_documents_by_language.return_value = {
-            "EN": {
-                "SourceA": [
-                    {
-                        "File": {"Name": "doc1.pdf", "TimeLastModified": "2023-01-01T12:00:00Z", "ServerRelativeUrl": "/sites/Test/doc1.pdf"},
-                        "Language": "EN",
-                        "Source": "SourceA",
-                    },
-                ]
-            }
+        url = client._build_url("/_api/web/lists")
+        expected = "https://bnpparibas.sharepoint.com/sites/test_site/_api/web/lists"
+
+        assert url == expected
+
+    def test_build_url_with_leading_slash(self, mock_config, mock_authenticator):
+        """Test URL building with leading slash in endpoint."""
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+
+        url = client._build_url("/_api/web/lists")
+        expected = "https://bnpparibas.sharepoint.com/sites/test_site/_api/web/lists"
+
+        assert url == expected
+
+    def test_get_headers(self, mock_config, mock_authenticator):
+        """Test request headers generation."""
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+
+        headers = client._get_headers()
+
+        expected = {
+            "Authorization": "Bearer test_token",
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose",
         }
-        # 2. Mock the document processor to indicate the file was uploaded/updated
-        self.mock_doc_processor.process_document.return_value = (True, b"file content")
-        # 3. Mock the config handler to return a list of languages
-        self.mock_config_handler.get_config.return_value = ["EN", "FR"]
+        assert headers == expected
 
-        # Run the orchestrator
-        await self.orchestrator.run(self.mock_project_args)
+    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    def test_send_request_success(self, mock_get, mock_config, mock_authenticator):
+        """Test successful API request."""
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.json.return_value = {"test": "data"}
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
 
-        # 4. Assertions to verify the correct behavior
-        self.mock_sp_service.get_deleted_file_names.assert_called_once()
-        self.mock_doc_processor.delete_document.assert_not_called()
-        self.mock_sp_service.get_documents_by_language.assert_called_once_with(["Documents"])
-        self.mock_doc_processor.process_document.assert_called_once()
-        self.mock_db_manager.update_for_language.assert_called_once_with(
-            language="EN",
-            new_documents=unittest.mock.ANY,  # We don't care about the exact list, just that it was passed
-            project_name="test_project",
-        )
+        client = SharePointAPIClient(mock_config, mock_authenticator)
 
-    async def test_run_with_deleted_documents(self):
-        """Test the orchestrator when files have been deleted from SharePoint."""
-        # 1. Mock the SharePoint service to return deleted file names
-        self.mock_sp_service.get_deleted_file_names.return_value = ["deleted_doc.docx", "old_file.pdf"]
-        self.mock_sp_service.get_documents_by_language.return_value = {}  # No new documents
+        result = client.send_request("/_api/web/lists")
 
-        # 2. Run the orchestrator
-        await self.orchestrator.run(self.mock_project_args)
+        assert result == {"test": "data"}
+        mock_get.assert_called_once()
 
-        # 3. Assertions
-        self.mock_sp_service.get_deleted_file_names.assert_called_once()
-        self.assertEqual(self.mock_doc_processor.delete_document.call_count, 2)
-        self.mock_doc_processor.delete_document.assert_any_call(file_name="deleted_doc.docx")
-        self.mock_doc_processor.delete_document.assert_any_call(file_name="old_file.pdf")
-        self.mock_db_manager.update_for_language.assert_not_called()
+    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    def test_send_request_json_decode_error(self, mock_get, mock_config, mock_authenticator):
+        """Test API request with JSON decode error."""
+        # Setup mock response
+        mock_response = Mock()
+        mock_response.json.side_effect = requests.JSONDecodeError("msg", "doc", 0)
+        mock_response.content = b"raw content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
 
-    async def test_run_with_language_filter(self):
-        """Test the orchestrator's language filter functionality."""
-        # 1. Set the language filter in the mock arguments
-        self.mock_project_args.language = "FR"
-        self.mock_config_handler.get_config.return_value = ["EN", "FR"]
+        client = SharePointAPIClient(mock_config, mock_authenticator)
 
-        # 2. Mock SharePoint to return documents in multiple languages
-        self.mock_sp_service.get_deleted_file_names.return_value = []
-        self.mock_sp_service.get_documents_by_language.return_value = {
-            "EN": {
-                "SourceA": [{"File": {"Name": "doc_en.pdf"}, "Language": "EN", "Source": "SourceA"}],
-            },
-            "FR": {
-                "SourceB": [{"File": {"Name": "doc_fr.docx"}, "Language": "FR", "Source": "SourceB"}],
-            },
+        result = client.send_request("/_api/web/lists")
+
+        assert result == {"content": b"raw content"}
+
+    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    def test_send_request_connection_error(self, mock_get, mock_config, mock_authenticator):
+        """Test API request with connection error."""
+        mock_get.side_effect = requests.ConnectionError("Connection failed")
+
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+
+        with pytest.raises(ConnectionError, match="Failed to send request"):
+            client.send_request("/_api/web/lists")
+
+    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    def test_download_file_success(self, mock_get, mock_config, mock_authenticator):
+        """Test successful file download."""
+        mock_response = Mock()
+        mock_response.content = b"file content"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
+
+        client = SharePointAPIClient(mock_config, mock_authenticator)
+
+        content = client.download_file("/sites/test/document.docx")
+
+        assert content == b"file content"
+
+##Here is the original code;
+
+"""SharePointAPIClient class."""
+
+from typing import Any
+
+import requests
+
+from bnppf_rag_engine.rag_engine.sharepoint.authenticator import (
+    SharePointAuthenticator,
+)
+from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
+    SharePointConfig,
+)
+
+
+class SharePointAPIClient:
+    """Handles SharePoint API communication."""
+
+    def __init__(self, sp_config: SharePointConfig, authenticator: SharePointAuthenticator):  # noqa: D107
+        self.config = sp_config
+        self.authenticator = authenticator
+
+    def send_request(self, endpoint: str) -> dict[str, Any]:
+        """Send request to SharePoint API."""
+        headers = self._get_headers()
+        url = self._build_url(endpoint)
+        try:
+            response = requests.get(
+                url, headers=headers, proxies=self.authenticator.get_proxies(), verify=True, timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.JSONDecodeError:
+            return {"content": response.content}
+        except requests.RequestException as e:
+            raise ConnectionError(f"Failed to send request to {url}: {e}") from e
+
+    def download_file(self, server_relative_url: str) -> bytes:
+        """Download file content from SharePoint."""
+        endpoint = f"/_api/web/GetFileByServerRelativeUrl('{server_relative_url}')/$Value"
+        headers = self._get_headers()
+        url = self._build_url(endpoint)
+
+        response = requests.get(url, headers=headers, proxies=self.authenticator.get_proxies(), verify=True, timeout=30)
+        response.raise_for_status()
+        return response.content
+
+    def _get_headers(self) -> dict[str, str]:
+        """Get request headers with authentication."""
+        return {
+            "Authorization": f"Bearer {self.authenticator.get_access_token()}",
+            "Accept": "application/json;odata=verbose",
+            "Content-Type": "application/json;odata=verbose",
         }
-        self.mock_doc_processor.process_document.return_value = (True, b"file content")
 
-        # 3. Run the orchestrator
-        await self.orchestrator.run(self.mock_project_args)
-
-        # 4. Assertions
-        # The orchestrator should process all documents to check their status
-        self.assertEqual(self.mock_doc_processor.process_document.call_count, 2)
-        # However, it should only call update_for_language for the French documents
-        self.mock_db_manager.update_for_language.assert_called_once_with(
-            language="FR",
-            new_documents=unittest.mock.ANY,
-            project_name="test_project",
-        )
-
-
-if __name__ == "__main__":
-    # This allows you to run the tests directly from the command line
-    unittest.main(argv=["first-arg-is-ignored"], exit=False, verbosity=2)
+    def _build_url(self, endpoint: str) -> str:
+        """Build complete URL for API endpoint."""
+        clean_endpoint = endpoint.lstrip("/")
+        return f"{self.config.site_base}/sites/{self.config.site_name}/{clean_endpoint}"

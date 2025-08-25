@@ -1,4 +1,4 @@
-#Here is client.py
+"""SharePointClient class."""
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +75,11 @@ class SharePointClient:
                 )
 
                 # Process document normally
-                was_uploaded = self.document_processor.process_document(doc=doc, parsed_args=doc_args)
+                was_uploaded, file_content = self.document_processor.process_document(doc=doc, parsed_args=doc_args)
 
                 # Track if document was newly uploaded along with the original doc_data
                 if was_uploaded:
+                    doc.content = file_content #store the file content
                     self.newly_uploaded_documents[language].append(doc)
 
     def _get_grouped_documents(self, libraries: list[str]) -> dict[str, dict[str, list[dict]]]:
@@ -116,6 +117,24 @@ class SharePointClient:
             for item in items
         ]
 
+    def _get_deleted_file_names(self) -> list[str]:
+        """Get list of deleted file names from recycle bin."""
+        try:
+            response = self.api_client.send_request(
+                "/_api/site/RecycleBin?$filter=ItemState eq 1&$expand=ListItem,ListItem/FieldValueAsText"
+            )
+            deleted_documents = response.get("d", {}).get("results", [])
+            return [doc.get("Title", "") for doc in deleted_documents if doc.get("Title")]
+        except (ConnectionError, KeyError):
+            return []
+
+    def _initialize_azure_credentials(self) -> AzureCredentials:
+        """Initialize Azure credentials."""
+        tenant_id = os.environ["AZURE_TENANT_ID"]
+        if not tenant_id:
+            raise ValueError("AZURE_TENANT_ID environment variable is required")
+
+        return AzureCredentials.from_env(tenant_id, self.config.site_base)
 
     async def _update_vector_db_for_language(self, language: str, config_handler: ConfigHandler, project_args) -> None:
         """Update vector DB with newly uploaded documents for a specific language."""
@@ -204,7 +223,7 @@ class SharePointClient:
                 try:
                     # Parse document using SharePoint File object
                     parsed_doc = await self._parse_document_from_resource(
-                        sp_file=doc.file, source=source, language=language
+                        sp_file=doc.file, content=doc.content, source=source, language=language
                     )
 
                     if parsed_doc:
@@ -226,7 +245,7 @@ class SharePointClient:
 
         return data_source_to_documents
 
-    async def _parse_document_from_resource(self, sp_file: dict, source: str, language: str) -> Document | None:
+    async def _parse_document_from_resource(self, sp_file: dict, content: bytes, source: str, language: str) -> Document | None:
         """Parse a single document directly from SharePoint File object using temporary file."""
         import os
         from pathlib import Path
@@ -258,13 +277,11 @@ class SharePointClient:
             return None
 
         try:
-            # Download file content from SharePoint
-            file_content = self.api_client.download_file(server_relative_url=server_relative_url)
 
             # Create temporary file with correct extension
             suffix = f".{file_extension}"
             with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                temp_file.write(file_content)
+                temp_file.write(content)
                 temp_file_path = Path(temp_file.name)
 
             try:
@@ -291,90 +308,20 @@ class SharePointClient:
         except Exception as e:
             logger.error(f"Failed to parse document {file_name}: {e}")
             return None
-			
-##Here is the document_processor.py
 
-class DocumentProcessor:
-    """Processes SharePoint documents."""
+    @staticmethod
+    def _create_cos_api() -> CosBucketApi:
+        """Create COS API instance."""
+        return create_cos_api()
 
-    def __init__(  # noqa: D107
-        self, api_client: SharePointAPIClient, cos_api: CosBucketApi, metadata_manager: MetadataManager
-    ):
-        self.api_client = api_client
-        self.cos_api = cos_api
-        self.metadata_manager = metadata_manager
-        self.path_manager = PathManager()
+    @staticmethod
+    def _get_config_handler(project_name: str):
+        """Get configuration handler."""
+        return get_or_raise_config(project_name)
 
-    def process_document(self, doc: ProcessedDocument, parsed_args) -> bool:
-        """Process a single document. Returns True if document was uploaded/updated."""
-        file_info = doc.file
-        file_name, last_modified, source, language = (
-            file_info["Name"],
-            file_info["TimeLastModified"],
-            doc.source,
-            doc.language,
-        )
-
-        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
-
-        if not DocumentFilter.is_parseable(file_name):
-            self._log_unparseable_document(file_name, doc, parsed_args)
-            return False
-
-        if not DocumentFilter.is_recently_modified(last_modified):
-            if not self.cos_api.file_exists(file_path):
-                # File does not exist, upload it
-                self._upload_document(doc, file_path)
-                return True
-            return False  # File exists and not recently modified
-
-        # File was recently modified, upload it
-        self._upload_document(doc, file_path)
-        return True
-
-    
-
-    def _upload_document(self, doc: ProcessedDocument, document_path: str) -> None:
-        """Upload document to COS and save metadata."""
-        file_info = doc.file
-        file_name, server_relative_url = file_info["Name"], file_info["ServerRelativeUrl"]
-
-        logger.info("Downloading document %s from sharepoint...", file_name)
-
-        # Download file content
-        file_content = self.api_client.download_file(server_relative_url)
-
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as temp_file:
-            temp_file.write(file_content)
-            temp_file_path = temp_file.name
-
-        try:
-            logger.info("Uploading document %s to COS...", file_name)
-            # Upload to COS
-            self.cos_api.upload_file(temp_file_path, document_path)
-
-            # Save metadata
-            metadata = DocumentMetadata(
-                file_name=file_name,
-                url=server_relative_url,
-                created_by=file_info.get("Author"),
-                last_modified=file_info["TimeLastModified"],
-                nota_number=doc.nota_number,
-                language=doc.language,
-                source=doc.source,
-            )
-
-            metadata_path = self.path_manager.get_metadata_path()
-            self.metadata_manager.write_metadata(metadata, metadata_path)
-
-        finally:
-            # Clean up temporary file
-            os.unlink(temp_file_path)
-
-##In order to get the content of the file from sharepoint we call self.api_client.download_file in both document_processor and sharepoint client which is not needed I think.
-Can you help me to refactor?
-		
-		
-
-   
+    @staticmethod
+    def _get_languages(lang_args, config_handler) -> list[str]:
+        """Get list of languages to process."""
+        if hasattr(lang_args, "language") and lang_args.language:
+            return [lang_args.language]
+        return config_handler.get_config("languages")

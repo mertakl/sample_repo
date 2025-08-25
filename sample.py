@@ -1,4 +1,3 @@
-
 class SharePointClient:
     """Main SharePoint client class."""
 
@@ -15,6 +14,7 @@ class SharePointClient:
         self.parser = None
 
         # Track processed documents for vector DB updates
+        # Now stores both the ProcessedDocument and the file content
         self.newly_uploaded_documents = defaultdict(list)
 
     async def run(self, project_args) -> None:
@@ -33,7 +33,7 @@ class SharePointClient:
 
         for language in languages:
             documents = grouped_documents.get(language, {})
-            self._process_documents_by_language(documents, project_args)
+            await self._process_documents_by_language(documents, project_args)
 
             # Update vector DB if new documents were uploaded for this language
             if self.newly_uploaded_documents.get(language):
@@ -51,7 +51,7 @@ class SharePointClient:
         except (ConnectionError, ValueError, KeyError) as e:
             logger.error("Failed to process deleted files: %s", e)
 
-    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args) -> None:
+    async def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args) -> None:
         """Process documents grouped by source for a specific language."""
         for source, doc_list in documents_by_source.items():
             for doc_data in doc_list:
@@ -62,12 +62,19 @@ class SharePointClient:
                     source=source,
                     language=language,
                 )
-                self.document_processor.process_document(doc=doc, parsed_args=doc_args)
-
-                # Track if document was newly uploaded
-                was_uploaded = self.document_processor.process_document(doc=doc, parsed_args=doc_args)
-                if was_uploaded:
-                    self.newly_uploaded_documents[language].append(doc)
+                
+                # Process document and get both upload status and file content
+                upload_result = await self.document_processor.process_document_with_content(
+                    doc=doc, parsed_args=doc_args
+                )
+                
+                # Track if document was newly uploaded along with its content
+                if upload_result["was_uploaded"]:
+                    self.newly_uploaded_documents[language].append({
+                        "doc": doc,
+                        "file_content": upload_result["file_content"],
+                        "file_path": upload_result["file_path"]  # Local path where file was downloaded
+                    })
 
     def _get_grouped_documents(self, libraries: list[str]) -> dict[str, dict[str, list[dict]]]:
         """Get documents grouped by language and source."""
@@ -130,8 +137,8 @@ class SharePointClient:
         )
 
         try:
-            # Parse only the newly uploaded documents
-            data_source_to_documents = await self._parse_new_documents(
+            # Parse the newly uploaded documents using their cached content
+            data_source_to_documents = await self._parse_new_documents_from_cache(
                 language=language, config_handler=config_handler, project_args=project_args
             )
 
@@ -188,36 +195,36 @@ class SharePointClient:
         nb_keys = len(document_chunks)
         if unique_keys != nb_keys:
             warning_message = f"Duplicate keys found in document chunks: {unique_keys} unique keys for {nb_keys} chunks"
-
             warnings.warn(warning_message, stacklevel=2)
 
         return document_chunks
 
-    async def _parse_new_documents(
+    async def _parse_new_documents_from_cache(
         self, language: str, config_handler: ConfigHandler, project_args
     ) -> dict[str, list[Document]]:
-        """Parse only the newly uploaded documents."""
+        """Parse newly uploaded documents using their cached file content."""
         # Create a temporary mapping of newly uploaded documents by source
         new_docs_by_source = defaultdict(list)
-        for doc in self.newly_uploaded_documents[language]:
-            new_docs_by_source[doc.source].append(doc)
+        for doc_info in self.newly_uploaded_documents[language]:
+            source = doc_info["doc"].source
+            new_docs_by_source[source].append(doc_info)
 
         data_source_to_documents = {}
 
-        for source, docs in new_docs_by_source.items():
+        for source, doc_infos in new_docs_by_source.items():
             parsed_docs = []
             unparsable_docs = []
 
-            for doc in docs:
+            for doc_info in doc_infos:
+                doc = doc_info["doc"]
                 file_name = doc.file["Name"]
-                file_path = self.document_processor.path_manager.get_document_path(
-                    source=source, language=language, file_name=file_name
-                )
 
                 try:
-                    # Download the file from COS to parse it
-                    parsed_doc = await self._parse_document_from_cos(
-                        file_path=file_path, source=source, language=language
+                    # Parse document using the cached file path (no COS download needed)
+                    parsed_doc = await self._parse_document_from_local_path(
+                        file_path=doc_info["file_path"],
+                        source=source,
+                        language=language
                     )
 
                     if parsed_doc:
@@ -239,10 +246,9 @@ class SharePointClient:
 
         return data_source_to_documents
 
-    async def _parse_document_from_cos(self, file_path: str, source: str, language: str) -> Document | None:
-        """Parse a single document from COS."""
+    async def _parse_document_from_local_path(self, file_path: str, source: str, language: str) -> Document | None:
+        """Parse a single document from local file path."""
         from pathlib import Path
-        from tempfile import TemporaryDirectory
 
         # Get the appropriate parser for this source
         parser_config = self.parser.parser_config
@@ -258,30 +264,23 @@ class SharePointClient:
         parser_info = parser_config["extension_to_parser_map"][file_extension]
         file_parser = PARSER_NAME_TO_OBJECT[parser_info["name"]](**parser_info["kwargs"])
 
-        with TemporaryDirectory() as temp_dir:
-            temp_file_path = Path(temp_dir) / Path(file_path).name
+        try:
+            # Parse the document directly from the local path
+            document = await file_parser.parse_as_document(path=Path(file_path), id=Path(file_path).name)
 
-            # Download file from COS
-            file_content = self.cos_api.read_file(cos_filename=file_path)
-            temp_file_path.write_bytes(file_content.read())
+            # Apply Eureka-specific processing if needed
+            if source == EUREKA:
+                document = self.parser.update_titles_and_depths_eureka_nota(
+                    document=document,
+                    titles=self.parser.get_titles(filepath=file_path),
+                    language=language,
+                )
 
-            try:
-                # Parse the document
-                document = await file_parser.parse_as_document(path=temp_file_path, id=temp_file_path.name)
+            return document
 
-                # Apply Eureka-specific processing if needed
-                if source == EUREKA:
-                    document = self.parser.update_titles_and_depths_eureka_nota(
-                        document=document,
-                        titles=self.parser.get_titles(filepath=str(temp_file_path)),
-                        language=language,
-                    )
-
-                return document
-
-            except Exception as e:
-                logger.error(f"Failed to parse document {file_path}: {e}")
-                return None
+        except Exception as e:
+            logger.error(f"Failed to parse document {file_path}: {e}")
+            return None
 
     @staticmethod
     def _create_cos_api() -> CosBucketApi:

@@ -1,631 +1,14 @@
-@@In the following code;
-...rest of the code
+from collections import defaultdict
+import logging
+import os
+import tempfile
+from typing import Dict, List, Optional
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
-
-async def parse_documents(
-    config_handler: ConfigHandler,
-    language: AVAILABLE_LANGUAGES_TYPE,
-    should_export_label_studio: bool,
-    cos_bucket_api: CosBucketApi,
-    should_write_unparsed_docs: bool,
-    should_add_caption_for_table_blocks: bool,
-    should_add_eureka_url_in_metadata: bool,
-    document_difference_threshold: float,
-    project_name: str,
-) -> dict[str, list[Document]]:
-    """Parses the documents."""
-    parser = DocumentParser(config_handler)
-
-    # Parser
-    print(f"*****STARTING PARSING DOCUMENT IN {language}*****")
-    data_source_to_documents = await parser.parse_all_documents_from_cos(
-        cos_folder_path=f"refined/{V_COS_MINOR}/{language}",
-        language=language,
-        cos_bucket_api=cos_bucket_api,
-        should_write_unparsed_docs=should_write_unparsed_docs,
-        document_difference_threshold=document_difference_threshold,
-    )
-    print(f"*****FINISHING PARSING DOCUMENT IN {language}*****")
-
-    # Caption for tables
-    print(f"*****STARTING ADDING CAPTIONS FOR DOCUMENT IN {language}*****")
-    if should_add_caption_for_table_blocks:
-        data_source_to_documents = await add_caption_to_table_blocks(
-            data_source_to_documents=data_source_to_documents,
-            language=language,
-            project_name=project_name,
-        )
-    print(f"*****FINISHING ADDING CAPTIONS FOR DOCUMENT IN {language}*****")
-
-    # URLs for Eureka documents
-    print(f"*****STARTING ADDING URLS FOR DOCUMENT IN {language}*****")
-    if should_add_eureka_url_in_metadata:
-        data_source_to_documents = add_url_in_metadata(data_source_to_documents=data_source_to_documents)
-    print(f"*****FINISHING ADDING URLS FOR DOCUMENT IN {language}*****")
-
-    if should_export_label_studio:
-        export_label_studio_input(data_source_to_documents, project_name, language, config_handler=config_handler)
-
-    return data_source_to_documents
-
-
-async def parse_documents_and_save_or_read_cached_documents(  # pylint: disable=R0917, R0913
-    config_handler: ConfigHandler,
-    language: AVAILABLE_LANGUAGES_TYPE,
-    should_export_label_studio: bool,
-    cos_bucket_api: CosBucketApi,
-    should_write_unparsed_docs: bool,
-    should_add_caption_for_table_blocks: bool,
-    should_add_eureka_url_in_metadata: bool,
-    document_difference_threshold: float,
-    project_name: str,
-) -> dict[str, list[Document]]:
-    """Parses documents and writes the generated vector DB on the COS."""
-    sources = list(config_handler.get_config("document_parser")["sources"].keys())
-    document_object_cos_folder = config_handler.get_config("document_parser")["document_object_cos_folder"]
-    if should_use_cache_if_exists:
-        data_source_to_documents = read_parsed_documents_from_cos(
-            cos_bucket_api=cos_bucket_api,
-            document_object_cos_folder=document_object_cos_folder,
-            v_cos_patch=V_COS_PATCH,
-            language=language,
-            sources=sources,
-        )
-        if data_source_to_documents is not None:
-            return data_source_to_documents
-
-    data_source_to_documents = await parse_documents(
-        config_handler=config_handler,
-        language=language,
-        cos_bucket_api=cos_bucket_api,
-        should_write_unparsed_docs=should_write_unparsed_docs,
-        should_add_caption_for_table_blocks=should_add_caption_for_table_blocks,
-        should_export_label_studio=should_export_label_studio,
-        should_add_eureka_url_in_metadata=should_add_eureka_url_in_metadata,
-        document_difference_threshold=document_difference_threshold,
-        project_name=project_name,
-    )
-
-    
-	dump_model_on_cos(
-		cos_bucket_api=cos_bucket_api,
-		data_source_to_documents=data_source_to_documents,
-		cos_folder_path=document_object_cos_folder,
-		v_cos_patch=V_COS_PATCH,
-		language=language,
-		sources=sources,
-		should_overwrite_on_cos=False,
-	)
-
-    return data_source_to_documents
-
-
-def create_document_chunks(
-    config_handler: ConfigHandler, data_source_to_documents: dict[str, list[Document]]
-) -> list[DocumentChunk]:
-    splitter = DocumentSplitter(config_handler.get_config("document_splitter"))
-    documents = DocumentParser.concat_documents(document=data_source_to_documents)
-    document_chunks = splitter.split_documents(documents)
-
-    unique_keys = len({chunk.key for chunk in document_chunks})
-    nb_keys = len(document_chunks)
-    if unique_keys != nb_keys:
-        warning_message = f"Duplicate keys found in document chunks: {unique_keys} unique keys for {nb_keys} chunks"
-
-        warnings.warn(warning_message, stacklevel=2)
-
-    return document_chunks
-
-
-async def generate_vector_db(
-    should_export_label_studio: bool,
-    cos_bucket_api: CosBucketApi,
-    config_handler: ConfigHandler,
-    should_write_unparsed_docs: bool,
-    should_add_caption_for_table_blocks: bool,
-    should_add_eureka_url_in_metadata: bool,
-    document_difference_threshold: float,
-    language: str | None = None,
-) -> None:
-    # Language selection
-    assert not (language), "Cannot upload to COS when language is explicitly given."
-    languages = [language] if language else config_handler.get_config("languages")
-
-    for lan in languages:
-        data_source_to_documents: dict[str, list[Document]] = await parse_documents_and_save_or_read_cached_documents(
-            config_handler=config_handler,
-            language=lan,
-            should_export_label_studio=should_export_label_studio,
-            cos_bucket_api=cos_bucket_api,
-            should_write_unparsed_docs=should_write_unparsed_docs,
-            should_add_caption_for_table_blocks=should_add_caption_for_table_blocks,
-            should_add_eureka_url_in_metadata=should_add_eureka_url_in_metadata,
-            document_difference_threshold=document_difference_threshold,
-            project_name=config_handler.get_config("project_name"),
-        )
-
-        document_chunks = create_document_chunks(config_handler, data_source_to_documents)
-
-        vector_db = VectorDB(
-            vector_db_config=config_handler.get_config("vector_db"),
-            embedding_model=BNPPFEmbeddings(config_handler.get_config("embedding_model")),
-            language=lan,
-            project_name=config_handler.get_config("project_name"),
-        )
-        vector_db.setup_db_instance()
-        # Important: start the DB from scratch for each language
-        drop_and_resetup_vector_db(vector_db.vector_db_config)
-        await vector_db.from_chunks(document_chunks)
-        
-		await vector_db.to_cos(cos_bucket_api, should_overwrite_on_cos=False)
-        
-
-...rest of the code
-
----document_parser.py
-class DocumentParser:
-    """Class to manage the parsing of the documents."""
-
-    def __init__(self, config_handler: ConfigHandler) -> None:
-        """Initialize the DocumentParser class with a specific configuration.
-
-        Args:
-            config_handler (ConfigHandler): Configuration handler
-        """
-        self.config_handler = config_handler
-        self.parser_config = config_handler.get_config("document_parser")
-        self.data_source_enum = config_handler.get_source_enum()
-        self.document_object_cos_folder = self.parser_config["document_object_cos_folder"]
-
-    async def parse_all_documents_from_cos(
-        self,
-        cos_folder_path: str,
-        language: AVAILABLE_LANGUAGES_TYPE,
-        cos_bucket_api: CosBucketApi,
-        should_write_unparsed_docs: bool,
-        document_difference_threshold: float,
-    ) -> dict[str, list[Document]]:
-        """Parses both KBM et Eureka documents.
-
-        Args:
-            cos_folder_path (str): Path to the COS folder containing the documents
-            language: language of the documents
-            cos_bucket_api: object to interact with the COS
-            should_write_unparsed_docs: bool to know if we should write the file
-            document_difference_threshold: cutoff distance score between 2 documents
-
-        Returns:
-            A dictionary with the source as keys and the list Documents as values
-        """
-        filepaths_to_ignore: list[str] = get_duplicate_file_candidates_from_cos(
-            output_path=OUTPUTS_PATH,
-            score_threshold=document_difference_threshold,
-            cos_bucket_api=cos_bucket_api,
-            config_handler=self.config_handler,
-        )
-
-        document = {}
-        for source in self.parser_config["sources"].keys():
-            document[source] = await self.parse_one_source_from_cos(
-                cos_folder_path=cos_folder_path,
-                source=source,
-                language=language,
-                cos_bucket_api=cos_bucket_api,
-                should_write_unparsed_docs=should_write_unparsed_docs,
-                filepaths_to_ignore=filepaths_to_ignore,
-                project_name=self.config_handler.get_config("project_name"),
-            )
-
-        return document
-
-    async def parse_one_source_from_cos(
-        self,
-        cos_folder_path: str,
-        project_name: str,
-        source: "self.enum_type",
-        language: AVAILABLE_LANGUAGES_TYPE,
-        cos_bucket_api: CosBucketApi,
-        should_write_unparsed_docs: bool,
-        filepaths_to_ignore: list[str],
-    ) -> list[Document]:
-        """Chooses which type of parsing to use depending on config.
-
-        Args:
-            cos_folder_path (str): Path to the COS folder containing the documents
-            project_name: Project name
-            source: source of the documents
-            language: language of the documents
-            cos_bucket_api: object to interact with the COS
-            should_write_unparsed_docs: bool to know if we should write the file
-            filepaths_to_ignore: list of document paths to ignore
-
-        Returns:
-            list[Document]: A list of parsed documents.
-
-        Raises:
-            ValueError: If the parser type is not supported.
-        """
-        if self.parser_config["type"] == "rag_toolbox":
-            return await self.parse_one_source_from_cos_rag_toolbox(
-                cos_folder_path=cos_folder_path,
-                source=source,
-                language=language,
-                project_name=project_name,
-                cos_bucket_api=cos_bucket_api,
-                should_write_unparsed_docs=should_write_unparsed_docs,
-                filepaths_to_ignore=filepaths_to_ignore,
-            )
-
-        raise ValueError("Unsupported document parser type")
-
-    async def parse_one_source_from_cos_rag_toolbox(  # pylint: disable=R0914
-        self,
-        cos_folder_path: str,
-        source: "self.enum_type",
-        language: AVAILABLE_LANGUAGES_TYPE,
-        project_name: str,
-        cos_bucket_api: CosBucketApi,
-        should_write_unparsed_docs: bool,
-        filepaths_to_ignore: list[str],
-    ) -> list[Document]:
-        """Parses documents from a COS folder.
-
-        Args:
-            cos_folder_path (str): Path to the COS folder containing the documents
-            source: source of the documents
-            language: fr or nl
-            project_name: project_name
-            cos_bucket_api: object to interact with the COS
-            should_write_unparsed_docs: bool to know if we should write the file
-            filepaths_to_ignore: list of document paths to ignore
-
-        Returns:
-            A list of parsed documents.
-
-        Raises:
-            ValueError: If the parser type is not supported.
-        """
-        file_extensions = self.parser_config["sources"][source]
-        parsers_info = [self.parser_config["extension_to_parser_map"][extension] for extension in file_extensions]
-        parsers = [PARSER_NAME_TO_OBJECT[parser_info["name"]](**parser_info["kwargs"]) for parser_info in parsers_info]
-        max_documents_to_parse = self.parser_config.get("max_documents_to_parse", -1)
-        parsed_docs = []
-        unparsable_docs = []
-
-        subfolders = self.parser_config["cos_bucket_subfolder"][source]
-        for parser, subfolder in zip(parsers, subfolders):
-            all_files = cos_bucket_api.list_files_in_bucket_folder(
-                bucket_prefix=(
-                    f"{cos_folder_path}/{source}/{subfolder}" if subfolder else f"{cos_folder_path}/{source}"
-                ),
-                recursive=True,
-            )
-            # Remove some files from all_files because they are too similar to other file
-            all_files = [filepath for filepath in all_files if filepath not in filepaths_to_ignore]
-            if max_documents_to_parse > 0 and len(parsed_docs) < max_documents_to_parse:
-                all_files = all_files[: max_documents_to_parse - len(parsed_docs)]
-            number_of_all_files = len(all_files)
-            for filename in tqdm(all_files, f"Parsing {source} document in {language}"):
-                parsed_file_or_error_msg = await self.parse_one_file_from_cos(
-                    filename=filename,
-                    cos_bucket_api=cos_bucket_api,
-                    parser=parser,
-                    source=source,
-                    language=language,
-                )
-                if isinstance(parsed_file_or_error_msg, Document):
-                    parsed_docs.append(parsed_file_or_error_msg)
-                else:
-                    unparsable_docs.append(parsed_file_or_error_msg)
-
-        if should_write_unparsed_docs and unparsable_docs:
-            self.write_unparsed_docs(
-                unparsable_docs=unparsable_docs, source=source, language=language, project_name=project_name
-            )
-            logger.warning("The parser could not parse %d documents over %d", len(unparsable_docs), number_of_all_files)
-            print(f"The parser could not parse {len(unparsable_docs)} documents over {number_of_all_files}")
-        return parsed_docs
-
-    async def parse_one_file_from_cos(
-        self, filename: str, cos_bucket_api: CosBucketApi, parser: FileParser, source: str, language: str
-    ) -> Document | str:
-        with TemporaryDirectory() as folder:
-            file_path = Path(folder) / Path(filename).name
-            file_path.write_bytes(cos_bucket_api.read_file(cos_filename=filename).read())
-            try:
-                document = await parser.parse_as_document(path=file_path, id=file_path.name)
-                if source == EUREKA:
-                    document = update_titles_and_depths_eureka_nota(
-                        document=document,
-                        titles=get_titles(filepath=str(file_path)),
-                        language=language,
-                    )
-                return document
-            except (ValueError, AssertionError, FormatError) as e:
-                logger.exception(e)
-                logger.error("The parser could not parse document '%s'", file_path.name)
-                print(f"The parser could not parse document '{file_path.name}'")
-                return " because ".join([filename, str(e)])
-
-    @staticmethod
-    def write_unparsed_docs(
-        unparsable_docs: list[str],
-        source: "self.enum_type",
-        language: AVAILABLE_LANGUAGES_TYPE,
-        project_name: str,
-    ) -> None:
-        """Writes unparsed doc file locally."""
-        folder_path = Path(f"/mnt/data/aisc-ap04/{project_name.lower()}")
-        folder_path.mkdir(exist_ok=True, parents=True)
-        with open(folder_path / f"unparsed_docs_{source}_{language}.txt", "w") as outfile:
-            outfile.writelines(language + "\n")
-            outfile.writelines(str(d) + "\n" for d in unparsable_docs)
-
-    @staticmethod
-    def concat_documents(document: dict[str, list[Document]]) -> list[Document]:
-        """Concatenates the list of Documents to have only one list.
-
-        Args:
-            document: {key: kbm or eureka, values: list of documents}
-
-        Returns:
-            The concatenated documents
-        """
-        return [doc for doc_list in document.values() for doc in doc_list]
-
-
-def body_element(filepath: str) -> list[docx.oxml.text.paragraph.CT_P]:
-    """Return body element of a docx filepath used to get xml."""
-    return docx.Document(filepath)._body._body.xpath(".//w:p")  # pylint: disable=W0212
-
-
-def depth_from_xml(xml: str) -> int | None:
-    """Get depth from XML.
-
-    Args:
-        xml: XmlString object of the body element
-
-    Returns:
-        depth if any or None
-    """
-    if '<w:pStyle w:val="Heading"/>' in xml or '<w:pStyle w:val="Subtitle"/>' in xml:  # main titles
-        return 0
-    match_depth = re.search(r'<w:pStyle w:val="Contents([1-9]\d*)"', xml)  # depth
-    if match_depth and "__RefHeading___Toc" in xml:  # text in ToC
-        return int(match_depth.group(1))
-    return None  # not main titles nor ToC
-
-
-def get_titles(filepath: str) -> dict[str, int]:
-    """Extracts the titles of the document.
-
-    The document 'main' title will have depth=0.
-
-    Args:
-        filepath: the local path to the documents
-
-    Returns:
-        titles with key title and value depth
-    """
-    titles = {}
-    for item in body_element(filepath=filepath):
-        title_depth = depth_from_xml(str(item.xml))
-        if isinstance(title_depth, int) and item.text.split("\t")[0].strip():
-            titles[item.text.split("\t")[0].strip()] = title_depth
-    return titles
-
-
-def return_document_or_raise(
-    document: Document, failure_cause: str, should_keep_not_formatted_document: bool
-) -> Document | None:
-    """Returns document if we want to else raise error that will be caught in the try except."""
-    if should_keep_not_formatted_document:
-        return document
-    raise FormatError(failure_cause)
-
-
-def update_titles_and_depths_eureka_nota(
-    document: Document,
-    titles: dict[str, int],
-    language: AVAILABLE_LANGUAGES_TYPE,
-    should_keep_not_formatted_document: bool = SHOULD_KEEP_NOT_FORMATTED_DOCUMENTS,
-) -> Document:
-    blocks = []
-    main_title = ""
-    main_subtitle = ""
-    table_of_content_found = False
-
-    if len(titles) == 0:
-        return return_document_or_raise(
-            document=document,
-            failure_cause=f"0 titles found: {document.id}",
-            should_keep_not_formatted_document=should_keep_not_formatted_document,
-        )
-    if max(titles.values()) == 0:
-        return return_document_or_raise(
-            document=document,
-            failure_cause=f"No TOC: {document.id}",
-            should_keep_not_formatted_document=should_keep_not_formatted_document,
-        )
-
-    for block in document.blocks:
-        is_text_in_block = hasattr(block, "text")
-
-        if not is_text_in_block:  # TableBlock -> add a TextBlock instead to use caption
-            text_metadata = deepcopy(block.metadata)
-            del text_metadata["caption"]
-            text_metadata["is_llm_generated"] = True
-            text_metadata["main_title"] = main_title
-            text_metadata["main_subtitle"] = main_subtitle
-            blocks.append(  # add new TextBlock to use caption in generation
-                TextBlock(
-                    hyperlinks=block.hyperlinks,
-                    page=block.page,
-                    faq_id=block.faq_id,
-                    faq_role=block.faq_role,
-                    metadata=text_metadata,
-                    block_type="TextBlock",
-                    text=block.metadata.get("caption", "Caption was not generated properly. Do not use this source."),
-                )
-            )
-            block.metadata["main_title"] = main_title
-            block.metadata["main_subtitle"] = main_subtitle
-            block.metadata["is_llm_generated"] = False
-            blocks.append(block)  # keep TableBlock
-            continue
-
-        stripped_text = block.text.strip()
-        # if depth = 0 (document general title), we remove the chunk and add title in all chunk metadata
-        if titles.get(stripped_text, -1) == 0:
-            main_title, main_subtitle = update_document_titles(
-                main_title=main_title, main_subtitle=main_subtitle, stripped_text=stripped_text, document_id=document.id
-            )
-            del titles[stripped_text]
-        # remove block with the string "table of content"
-        elif stripped_text.lower() in TABLE_OF_CONTENT[language]:
-            table_of_content_found = True
-        # it's a Textblock, TitleBlock, ListItem or CodeBlock
-        elif stripped_text in titles:  # title is found -> transform to TitleBlock and update depth
-            block.metadata["main_title"] = main_title
-            block.metadata["main_subtitle"] = main_subtitle
-            block.metadata["is_llm_generated"] = False
-            blocks.append(
-                TitleBlock(
-                    hyperlinks=block.hyperlinks,
-                    page=block.page,
-                    faq_id=block.faq_id,
-                    faq_role=block.faq_role,
-                    metadata=block.metadata,
-                    block_type="TitleBlock",
-                    text=block.text,
-                    depth=titles[stripped_text],
-                )
-            )
-            del titles[stripped_text]
-        # no title found -> transform TitleBlock to TextBlock (as only titles should be TitleBlock)
-        elif block.block_type == "TitleBlock":
-            block.metadata["main_title"] = main_title
-            block.metadata["main_subtitle"] = main_subtitle
-            block.metadata["is_llm_generated"] = False
-            blocks.append(
-                TextBlock(
-                    hyperlinks=block.hyperlinks,
-                    page=block.page,
-                    faq_id=block.faq_id,
-                    faq_role=block.faq_role,
-                    metadata=block.metadata,
-                    block_type="TextBlock",
-                    text=stripped_text,
-                )
-            )
-        else:  # keep Textblock, ListItem or CodeBlock and update the title
-            block.metadata["main_title"] = main_title
-            block.metadata["main_subtitle"] = main_subtitle
-            block.metadata["is_llm_generated"] = False
-            blocks.append(block)
-
-    validation_output = validate_document_format(
-        document=document,
-        blocks=blocks,
-        titles=titles,
-        main_title=main_title,
-        main_subtitle=main_subtitle,
-        table_of_content_found=table_of_content_found,
-        should_keep_not_formatted_document=should_keep_not_formatted_document,
-    )
-
-    return validation_output or Document(
-        blocks=blocks,
-        id=document.id,
-        filename=document.filename,
-        metadata=document.metadata,
-    )
-
-
-def validate_document_format(
-    document: Document,
-    blocks: list[Block],
-    titles: dict[str, int],
-    main_title: str,
-    main_subtitle: str,
-    table_of_content_found: bool,
-    should_keep_not_formatted_document: bool,
-) -> Document | None:
-    """Validates (and returns if needed) document.
-
-    Args:
-        document: Parsed Document from Eureka
-        blocks: updated blocks from the document
-        titles: dict of titles to their depth
-        main_title: main title of the document
-        main_subtitle: main_subtitle of the document
-        table_of_content_found: True if the string "table of content" was found
-        should_keep_not_formatted_document: True to keep wrongly formatted document without updating them
-
-    Return:
-        - if should_keep_not_formatted_document is True:
-            - Validation failed: original document
-            - All validation passed: None
-        - if should_keep_not_formatted_document is False:
-            - Validation failed: raise FormatError that will be caught in the except
-            - All validation passed: None
-    """
-    if not table_of_content_found:
-        return return_document_or_raise(
-            document=document,
-            failure_cause=f"Table of content not found: {document.id}",
-            should_keep_not_formatted_document=should_keep_not_formatted_document,
-        )
-
-    # validate all blocks have the same main_title and main_subtitle
-    for block in blocks:
-        if block.metadata["main_title"] != main_title:
-            return return_document_or_raise(
-                document=document,
-                failure_cause=f"Not all blocks have the same main_title in {document.id}."
-                "This means a document main title is missplaced.",
-                should_keep_not_formatted_document=should_keep_not_formatted_document,
-            )
-        if block.metadata["main_subtitle"] != main_subtitle:
-            return return_document_or_raise(
-                document=document,
-                failure_cause=f"Not all blocks have the same main_subtitle in {document.id}."
-                "This means a document main title is missplaced.",
-                should_keep_not_formatted_document=should_keep_not_formatted_document,
-            )
-
-    # validate all titles were found
-    if len(titles) != 0:
-        return return_document_or_raise(
-            document=document,
-            failure_cause=f"Titles not found in {document.id}: {titles}",
-            should_keep_not_formatted_document=should_keep_not_formatted_document,
-        )
-    return None
-
-
-def update_document_titles(
-    main_title: str, main_subtitle: str, stripped_text: str, document_id: str
-) -> tuple[str, str]:
-    """Updates document main title and main subtitles."""
-    if not main_title:
-        main_title = stripped_text
-    elif not main_subtitle:
-        main_subtitle = stripped_text
-    else:
-        raise ValueError(
-            f"Main title {main_title} and main subtitle {main_subtitle} already found for document {document_id}."
-        )
-    return main_title, main_subtitle
-
-	
-
-## generate_vector_db is the main function to run. Which retrieves documents from ibm cos and saves to vector db.
-##I need to do same in this code except I only need to save the new files to vector db 
-##Here is the code that I am working on;
-------client.py
 class SharePointClient:
-    """Main SharePoint client class."""
+    """Main SharePoint client class with vector DB integration."""
 
     def __init__(self, sp_config: SharePointConfig):  # noqa: D107
         self.config = sp_config
@@ -637,9 +20,12 @@ class SharePointClient:
         self.api_client = SharePointAPIClient(sp_config, self.authenticator)
         self.metadata_manager = MetadataManager(self.cos_api)
         self.document_processor = DocumentProcessor(self.api_client, self.cos_api, self.metadata_manager)
+        
+        # Track processed documents for vector DB updates
+        self.newly_uploaded_documents = defaultdict(list)
 
     def run(self, project_args) -> None:
-        """Main execution method."""
+        """Main execution method with vector DB integration."""
         config_handler = self._get_config_handler(project_args.project_name)
         languages = self._get_languages(project_args, config_handler)
 
@@ -651,7 +37,170 @@ class SharePointClient:
 
         for language in languages:
             documents = grouped_documents.get(language, {})
-            self._process_documents_by_language(documents, project_args)
+            self._process_documents_by_language(documents, project_args, language)
+            
+            # Update vector DB if new documents were uploaded for this language
+            if self.newly_uploaded_documents.get(language):
+                await self._update_vector_db_for_language(
+                    language=language,
+                    config_handler=config_handler,
+                    project_args=project_args
+                )
+
+    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args, language: str) -> None:
+        """Process documents grouped by source for a specific language."""
+        for source, doc_list in documents_by_source.items():
+            for doc_data in doc_list:
+                doc = ProcessedDocument(
+                    file=doc_data["File"],
+                    nota_number=doc_data.get("NotaNumber"),
+                    source=source,
+                    language=doc_data.get("Language", ""),
+                )
+                
+                # Track if document was newly uploaded
+                was_uploaded = self.document_processor.process_document(doc=doc, parsed_args=doc_args)
+                if was_uploaded:
+                    self.newly_uploaded_documents[language].append(doc)
+
+    async def _update_vector_db_for_language(self, language: str, config_handler: ConfigHandler, project_args) -> None:
+        """Update vector DB with newly uploaded documents for a specific language."""
+        logger.info(f"Updating vector DB for {language} with {len(self.newly_uploaded_documents[language])} new documents")
+        
+        try:
+            # Parse only the newly uploaded documents
+            data_source_to_documents = await self._parse_new_documents(
+                language=language,
+                config_handler=config_handler,
+                project_args=project_args
+            )
+            
+            if not data_source_to_documents or not any(docs for docs in data_source_to_documents.values()):
+                logger.info(f"No parseable documents found for {language}")
+                return
+            
+            # Create document chunks
+            document_chunks = create_document_chunks(config_handler, data_source_to_documents)
+            
+            if not document_chunks:
+                logger.info(f"No document chunks created for {language}")
+                return
+            
+            # Initialize vector DB
+            vector_db = VectorDB(
+                vector_db_config=config_handler.get_config("vector_db"),
+                embedding_model=BNPPFEmbeddings(config_handler.get_config("embedding_model")),
+                language=language,
+                project_name=config_handler.get_config("project_name"),
+            )
+            vector_db.setup_db_instance()
+            
+            # Add new chunks to existing vector DB (don't drop and reset)
+            await vector_db.add_chunks(document_chunks)
+            
+            # Save updated vector DB to COS
+            await vector_db.to_cos(self.cos_api, should_overwrite_on_cos=True)
+            
+            logger.info(f"Successfully updated vector DB for {language}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update vector DB for {language}: {e}")
+            raise
+
+    async def _parse_new_documents(self, language: str, config_handler: ConfigHandler, project_args) -> dict[str, list[Document]]:
+        """Parse only the newly uploaded documents."""
+        parser = DocumentParser(config_handler)
+        
+        # Create a temporary mapping of newly uploaded documents by source
+        new_docs_by_source = defaultdict(list)
+        for doc in self.newly_uploaded_documents[language]:
+            new_docs_by_source[doc.source].append(doc)
+        
+        data_source_to_documents = {}
+        
+        for source, docs in new_docs_by_source.items():
+            parsed_docs = []
+            unparsable_docs = []
+            
+            for doc in docs:
+                file_name = doc.file["Name"]
+                file_path = self.document_processor.path_manager.get_document_path(
+                    source=source, 
+                    language=language, 
+                    file_name=file_name
+                )
+                
+                try:
+                    # Download the file from COS to parse it
+                    parsed_doc = await self._parse_document_from_cos(
+                        file_path=file_path,
+                        parser=parser,
+                        source=source,
+                        language=language
+                    )
+                    
+                    if parsed_doc:
+                        parsed_docs.append(parsed_doc)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to parse document {file_name}: {e}")
+                    unparsable_docs.append(f"{file_name} because {str(e)}")
+            
+            if unparsable_docs:
+                DocumentParser.write_unparsed_docs(
+                    unparsable_docs=unparsable_docs,
+                    source=source,
+                    language=language,
+                    project_name=project_args.project_name,
+                )
+            
+            data_source_to_documents[source] = parsed_docs
+        
+        return data_source_to_documents
+
+    async def _parse_document_from_cos(self, file_path: str, parser: DocumentParser, source: str, language: str) -> Optional[Document]:
+        """Parse a single document from COS."""
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        
+        # Get the appropriate parser for this source
+        parser_config = parser.parser_config
+        file_extensions = parser_config["sources"][source]
+        
+        # Determine file extension
+        file_extension = Path(file_path).suffix.lower()
+        if file_extension not in file_extensions:
+            logger.warning(f"File extension {file_extension} not supported for source {source}")
+            return None
+        
+        # Get parser for this extension
+        parser_info = parser_config["extension_to_parser_map"][file_extension]
+        file_parser = PARSER_NAME_TO_OBJECT[parser_info["name"]](**parser_info["kwargs"])
+        
+        with TemporaryDirectory() as temp_dir:
+            temp_file_path = Path(temp_dir) / Path(file_path).name
+            
+            # Download file from COS
+            file_content = self.cos_api.read_file(cos_filename=file_path)
+            temp_file_path.write_bytes(file_content.read())
+            
+            try:
+                # Parse the document
+                document = await file_parser.parse_as_document(path=temp_file_path, id=temp_file_path.name)
+                
+                # Apply Eureka-specific processing if needed
+                if source == "EUREKA":  # Adjust this constant as needed
+                    document = update_titles_and_depths_eureka_nota(
+                        document=document,
+                        titles=get_titles(filepath=str(temp_file_path)),
+                        language=language,
+                    )
+                
+                return document
+                
+            except Exception as e:
+                logger.error(f"Failed to parse document {file_path}: {e}")
+                return None
 
     def _process_deleted_files(self) -> None:
         """Process deleted files from recycle bin."""
@@ -663,18 +212,6 @@ class SharePointClient:
         except (ConnectionError, ValueError, KeyError) as e:
             logger.error("Failed to process deleted files: %s", e)
 
-    def _process_documents_by_language(self, documents_by_source: dict[str, list[dict]], doc_args) -> None:
-        """Process documents grouped by source for a specific language."""
-        for source, doc_list in documents_by_source.items():
-            for doc_data in doc_list:
-                doc = ProcessedDocument(
-                    file=doc_data["File"],
-                    nota_number=doc_data.get("NotaNumber"),
-                    source=source,
-                    language=doc_data.get("Language", ""),
-                )
-                self.document_processor.process_document(doc=doc, parsed_args=doc_args)
-
     def _get_grouped_documents(self, libraries: list[str]) -> dict[str, dict[str, list[dict]]]:
         """Get documents grouped by language and source."""
         logger.info("Grouping documents by their source and language.")
@@ -683,7 +220,7 @@ class SharePointClient:
 
         for library in libraries:
             try:
-			##Retrieve documents from sharepoint
+                # Retrieve documents from sharepoint
                 documents = self._retrieve_documents_from_library(library)
                 for doc in documents:
                     language, source = doc["Language"], doc["Source"]
@@ -694,14 +231,9 @@ class SharePointClient:
                 continue
 
         return grouped_documents
-        ]
 
 
-	..rest 
-
----document_processor.py
-	
-	class DocumentProcessor:
+class DocumentProcessor:
     """Processes SharePoint documents."""
 
     def __init__(  # noqa: D107
@@ -712,8 +244,8 @@ class SharePointClient:
         self.metadata_manager = metadata_manager
         self.path_manager = PathManager()
 
-    def process_document(self, doc: ProcessedDocument, parsed_args) -> None:
-        """Process a single document."""
+    def process_document(self, doc: ProcessedDocument, parsed_args) -> bool:
+        """Process a single document. Returns True if document was uploaded/updated."""
         file_info = doc.file
         file_name, last_modified, source, language = (
             file_info["Name"],
@@ -726,14 +258,18 @@ class SharePointClient:
 
         if not DocumentFilter.is_parseable(file_name):
             self._log_unparseable_document(file_name, doc, parsed_args)
-            return
+            return False
 
         if not DocumentFilter.is_recently_modified(last_modified):
             if not self.cos_api.file_exists(file_path):
-                # TODO: If the file does not exist already
+                # File does not exist, upload it
                 self._upload_document(doc, file_path)
-            return
+                return True
+            return False  # File exists and not recently modified
+        
+        # File was recently modified, upload it
         self._upload_document(doc, file_path)
+        return True
 
     def delete_document(self, file_name: str) -> None:
         """Delete document from COS and update metadata."""
@@ -755,6 +291,9 @@ class SharePointClient:
 
         # Remove from metadata
         self.metadata_manager.remove_metadata(metadata_path=metadata_path, file_name=file_name)
+        
+        # TODO: Also remove from vector DB
+        # This would require additional logic to remove specific document chunks from the vector DB
 
     def _upload_document(self, doc: ProcessedDocument, document_path: str) -> None:
         """Upload document to COS and save metadata."""
@@ -805,5 +344,3 @@ class SharePointClient:
 
         _, extension = os.path.splitext(file_name)
         logger.error("Files with extension '%s' are not supported", extension)
-		
-##So basically, I need you to save the files which are supposed to upload to COS. 

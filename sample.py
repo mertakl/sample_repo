@@ -1,98 +1,79 @@
+##Also this? 
+
+from datetime import datetime, timedelta, timezone
+
+from bnppf_rag_engine.rag_engine.sharepoint.document_filter import (
+    DocumentFilter,
+)
+
+
+class TestDocumentFilter:
+    """Test DocumentFilter class."""
+
+    def test_is_parseable_valid_extensions(self):
+        """Test parseable file detection for valid extensions."""
+        assert DocumentFilter.is_parseable("document.doc")
+        assert DocumentFilter.is_parseable("document.docx")
+        assert DocumentFilter.is_parseable("DOCUMENT.DOC")
+        assert DocumentFilter.is_parseable("DOCUMENT.DOCX")
+
+    def test_is_parseable_invalid_extensions(self):
+        """Test parseable file detection for invalid extensions."""
+        assert not DocumentFilter.is_parseable("document.pdf")
+        assert not DocumentFilter.is_parseable("document.txt")
+        assert not DocumentFilter.is_parseable("document.xlsx")
+        assert not DocumentFilter.is_parseable("document")
+
+    def test_is_recently_modified_recent_file(self):
+        """Test recent modification detection for recent files."""
+        recent_time = datetime.now(timezone.utc) - timedelta(hours=12)
+        time_str = recent_time.isoformat().replace("+00:00", "Z")
+
+        assert DocumentFilter.is_recently_modified(time_str, hours=24)
+
+    def test_is_recently_modified_old_file(self):
+        """Test recent modification detection for old files."""
+        old_time = datetime.now(timezone.utc) - timedelta(hours=48)
+        time_str = old_time.isoformat().replace("+00:00", "Z")
+
+        assert not DocumentFilter.is_recently_modified(time_str, hours=24)
+
+##Original code;
+
+"""DocumentFilter class."""
+
 import os
-from unittest.mock import Mock, mock_open, patch
-
-import pytest
-
-from bnppf_rag_engine.rag_engine.sharepoint.authenticator import (
-    SharePointAuthenticator,
-)
-from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
-    AzureCredentials,
-    SharePointConfig,
-)
+from datetime import datetime, timedelta, timezone
 
 
-class TestSharePointAuthenticator:
-    """Test SharePointAuthenticator class."""
+class DocumentFilter:
+    """Handles document filtering logic."""
 
-    @pytest.fixture
-    def mock_config(self):
-        """Create mock SharePoint config."""
-        return SharePointConfig(
-            crt_filepath="/path/to/cert.crt",
-            key_filepath="/path/to/key.key",
-            site_name="test_site",
-            site_base="https://test.sharepoint.com",
-        )
+    PARSEABLE_EXTENSIONS = {".doc", ".docx", ".pdf"}  # noqa: RUF012
 
-    @pytest.fixture
-    def mock_azure_creds(self):
-        """Create mock AzureCredentials."""
-        creds = Mock(spec=AzureCredentials)
-        creds.thumbprint = "test_thumbprint"
-        creds.client_id = "test_client_id"
-        creds.authority = "https://login.microsoftonline.com/test_tenant"
-        creds.scope = ["https://test.sharepoint.com/.default"]
-        return creds
+    @staticmethod
+    def is_parseable(file_name: str) -> bool:
+        """Check if document is parseable."""
+        _, extension = os.path.splitext(file_name)
+        return extension.lower() in DocumentFilter.PARSEABLE_EXTENSIONS
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_get_client_creds_initialization(self, mock_from_env, mock_config, mock_azure_creds):
-        """Test client credentials are correctly created during initialization."""
-        mock_from_env.return_value = mock_azure_creds
-        
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": "test_tenant"}):
-            authenticator = SharePointAuthenticator(mock_config)
+    @staticmethod
+    def is_recently_modified(last_modified_str: str, hours: int = 24) -> bool:
+        # TODO: update docstring
+        """Check if document was modified within specified hours."""
+        try:
+            last_modified = DocumentFilter._parse_datetime(last_modified_str)
+            current_time = datetime.now(timezone.utc)
+            time_difference = current_time - last_modified
+            return time_difference < timedelta(hours=hours)
+        except (ValueError, TypeError):
+            return False
 
-        creds = authenticator.azure_creds.client_creds
-        
-        assert creds["private_key"] == "file_content"
-        assert creds["thumbprint"] == "test_thumbprint"
-        assert creds["public_certificate"] == "file_content"
+    @staticmethod
+    def _parse_datetime(datetime_str: str) -> datetime:
+        """Parse datetime string to datetime object."""
+        if datetime_str.endswith("Z"):
+            datetime_str = datetime_str[:-1] + "+00:00"
+        return datetime.fromisoformat(datetime_str)
 
-    @patch.dict(os.environ, {"PROXY": "http://proxy.example.com"})
-    def test_get_proxies_with_proxy(self):
-        """Test proxy configuration when PROXY env var is set."""
-        proxies = SharePointAuthenticator.get_proxies()
-        expected = {"http": "http://proxy.example.com", "https": "http://proxy.example.com"}
-        assert proxies == expected
 
-    @patch.dict(os.environ, {}, clear=True)
-    def test_get_proxies_without_proxy(self):
-        """Test proxy configuration when PROXY env var is not set."""
-        proxies = SharePointAuthenticator.get_proxies()
-        assert proxies == {}
-
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.ConfidentialClientApplication")
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_get_access_token_success(self, mock_from_env, mock_app_class, mock_config, mock_azure_creds):
-        """Test successful token acquisition via the public get_access_token method."""
-        mock_from_env.return_value = mock_azure_creds
-        
-        mock_app = Mock()
-        mock_app.acquire_token_for_client.return_value = {"access_token": "test_access_token"}
-        mock_app_class.return_value = mock_app
-
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": "test_tenant"}):
-            authenticator = SharePointAuthenticator(mock_config)
-            token = authenticator.get_access_token()
-
-        assert token == "test_access_token"
-        mock_app.acquire_token_for_client.assert_called_once_with(scopes=mock_azure_creds.scope)
-
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.ConfidentialClientApplication")
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_get_access_token_error(self, mock_from_env, mock_app_class, mock_config, mock_azure_creds):
-        """Test token acquisition error via the public get_access_token method."""
-        mock_from_env.return_value = mock_azure_creds
-
-        mock_app = Mock()
-        mock_app.acquire_token_for_client.return_value = {"error": "invalid_client"}
-        mock_app_class.return_value = mock_app
-
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": "test_tenant"}):
-            authenticator = SharePointAuthenticator(mock_config)
-            with pytest.raises(ValueError, match="Error getting access token: invalid_client"):
-                authenticator.get_access_token()

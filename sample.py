@@ -1,4 +1,3 @@
-##Can you also fix these unit tests?
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,7 +18,10 @@ class TestSharePointAPIClient:
     def mock_config(self):
         """Create mock SharePoint config."""
         return SharePointConfig(
-            crt_filepath="/path/to/cert.crt", key_filepath="/path/to/key.key", site_name="test_site"
+            crt_filepath="/path/to/cert.crt",
+            key_filepath="/path/to/key.key",
+            site_name="test_site",
+            site_base="https://test.sharepoint.com"
         )
 
     @pytest.fixture
@@ -31,22 +33,18 @@ class TestSharePointAPIClient:
         return authenticator
 
     def test_build_url(self, mock_config, mock_authenticator):
-        """Test URL building."""
+        """Test URL building with and without a leading slash in the endpoint."""
         client = SharePointAPIClient(mock_config, mock_authenticator)
 
-        url = client._build_url("/_api/web/lists")
-        expected = "https://bnpparibas.sharepoint.com/sites/test_site/_api/web/lists"
+        # Test endpoint with a leading slash
+        url_with_slash = client._build_url("/_api/web/lists")
+        expected_with_slash = "https://test.sharepoint.com/sites/test_site/_api/web/lists"
+        assert url_with_slash == expected_with_slash
 
-        assert url == expected
-
-    def test_build_url_with_leading_slash(self, mock_config, mock_authenticator):
-        """Test URL building with leading slash in endpoint."""
-        client = SharePointAPIClient(mock_config, mock_authenticator)
-
-        url = client._build_url("/_api/web/lists")
-        expected = "https://bnpparibas.sharepoint.com/sites/test_site/_api/web/lists"
-
-        assert url == expected
+        # Test endpoint without a leading slash
+        url_without_slash = client._build_url("_api/web/lists")
+        expected_without_slash = "https://test.sharepoint.com/sites/test_site/_api/web/lists"
+        assert url_without_slash == expected_without_slash
 
     def test_get_headers(self, mock_config, mock_authenticator):
         """Test request headers generation."""
@@ -61,7 +59,7 @@ class TestSharePointAPIClient:
         }
         assert headers == expected
 
-    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    @patch("bnppf_rag_engine.rag_engine.sharepoint.api_client.requests.get")
     def test_send_request_success(self, mock_get, mock_config, mock_authenticator):
         """Test successful API request."""
         # Setup mock response
@@ -77,7 +75,7 @@ class TestSharePointAPIClient:
         assert result == {"test": "data"}
         mock_get.assert_called_once()
 
-    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    @patch("bnppf_rag_engine.rag_engine.sharepoint.api_client.requests.get")
     def test_send_request_json_decode_error(self, mock_get, mock_config, mock_authenticator):
         """Test API request with JSON decode error."""
         # Setup mock response
@@ -93,7 +91,7 @@ class TestSharePointAPIClient:
 
         assert result == {"content": b"raw content"}
 
-    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    @patch("bnppf_rag_engine.rag_engine.sharepoint.api_client.requests.get")
     def test_send_request_connection_error(self, mock_get, mock_config, mock_authenticator):
         """Test API request with connection error."""
         mock_get.side_effect = requests.ConnectionError("Connection failed")
@@ -103,7 +101,7 @@ class TestSharePointAPIClient:
         with pytest.raises(ConnectionError, match="Failed to send request"):
             client.send_request("/_api/web/lists")
 
-    @patch("bnppf_rag_engine.rag_engine.api_client.requests.get")
+    @patch("bnppf_rag_engine.rag_engine.sharepoint.api_client.requests.get")
     def test_download_file_success(self, mock_get, mock_config, mock_authenticator):
         """Test successful file download."""
         mock_response = Mock()
@@ -113,67 +111,20 @@ class TestSharePointAPIClient:
 
         client = SharePointAPIClient(mock_config, mock_authenticator)
 
-        content = client.download_file("/sites/test/document.docx")
-
-        assert content == b"file content"
-
-##Here is the original code;
-
-"""SharePointAPIClient class."""
-
-from typing import Any
-
-import requests
-
-from bnppf_rag_engine.rag_engine.sharepoint.authenticator import (
-    SharePointAuthenticator,
-)
-from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
-    SharePointConfig,
-)
-
-
-class SharePointAPIClient:
-    """Handles SharePoint API communication."""
-
-    def __init__(self, sp_config: SharePointConfig, authenticator: SharePointAuthenticator):  # noqa: D107
-        self.config = sp_config
-        self.authenticator = authenticator
-
-    def send_request(self, endpoint: str) -> dict[str, Any]:
-        """Send request to SharePoint API."""
-        headers = self._get_headers()
-        url = self._build_url(endpoint)
-        try:
-            response = requests.get(
-                url, headers=headers, proxies=self.authenticator.get_proxies(), verify=True, timeout=30
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.JSONDecodeError:
-            return {"content": response.content}
-        except requests.RequestException as e:
-            raise ConnectionError(f"Failed to send request to {url}: {e}") from e
-
-    def download_file(self, server_relative_url: str) -> bytes:
-        """Download file content from SharePoint."""
-        endpoint = f"/_api/web/GetFileByServerRelativeUrl('{server_relative_url}')/$Value"
-        headers = self._get_headers()
-        url = self._build_url(endpoint)
-
-        response = requests.get(url, headers=headers, proxies=self.authenticator.get_proxies(), verify=True, timeout=30)
-        response.raise_for_status()
-        return response.content
-
-    def _get_headers(self) -> dict[str, str]:
-        """Get request headers with authentication."""
-        return {
-            "Authorization": f"Bearer {self.authenticator.get_access_token()}",
+        content = client.download_file("/sites/test_site/document.docx")
+        
+        expected_url = "https://test.sharepoint.com/sites/test_site/_api/web/GetFileByServerRelativeUrl('/sites/test_site/document.docx')/$Value"
+        expected_headers = {
+            "Authorization": "Bearer test_token",
             "Accept": "application/json;odata=verbose",
             "Content-Type": "application/json;odata=verbose",
         }
 
-    def _build_url(self, endpoint: str) -> str:
-        """Build complete URL for API endpoint."""
-        clean_endpoint = endpoint.lstrip("/")
-        return f"{self.config.site_base}/sites/{self.config.site_name}/{clean_endpoint}"
+        assert content == b"file content"
+        mock_get.assert_called_once_with(
+            expected_url,
+            headers=expected_headers,
+            proxies={},
+            verify=True,
+            timeout=30,
+        )

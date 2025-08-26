@@ -1,115 +1,514 @@
-import os
-from unittest.mock import Mock, mock_open, patch
+##Here is the original code;
+"""MetadataManager class."""
 
+import logging
+from typing import Any
+
+import pandas as pd
+from bnppf_cos import CosBucketApi
+
+from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
+    DocumentMetadata,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class MetadataManager:
+    """Manages CSV metadata operations."""
+
+    def __init__(self, cos_api: CosBucketApi):  # noqa: D107
+        self.cos_api = cos_api
+
+    def get_metadata_by_filename(self, file_name: str, metadata_path: str) -> dict[str, Any] | None:
+        """Get metadata for specific file."""
+        if not self.cos_api.file_exists(metadata_path):
+            return None
+
+        try:
+            df = self.cos_api.read_csv(metadata_path, sep=";")
+            filtered_df = df[df["file_name"] == file_name]
+            return filtered_df.iloc[0].to_dict() if not filtered_df.empty else None
+        except (pd.errors.EmptyDataError, KeyError, IndexError):
+            return None
+
+    def write_metadata(self, metadata: DocumentMetadata, metadata_path: str) -> None:
+        """Write metadata to CSV file."""
+        try:
+            logger.info("Writing metadata information...")
+            if self.cos_api.file_exists(metadata_path):
+                existing_df = self.cos_api.read_csv(metadata_path, sep=";")
+            else:
+                existing_df = self._create_empty_dataframe()
+
+            new_entry = pd.DataFrame([metadata.__dict__])
+            updated_df = self._merge_metadata(existing_df, new_entry)
+
+            self.cos_api.df_to_csv(df=updated_df, cos_filename=metadata_path, header=True)
+
+        except (OSError, pd.errors.ParserError) as e:
+            error_message = f"Failed to remove metadata from {metadata_path}: {e}"
+            raise OSError(error_message) from e
+
+    def remove_metadata(self, metadata_path: str, file_name: str) -> None:
+        """Remove metadata for specific file."""
+        if not self.cos_api.file_exists(metadata_path):
+            return
+
+        try:
+            logger.info("Removing metadata information for %s...", file_name)
+
+            df = self.cos_api.read_csv(metadata_path, sep=";")
+            updated_df = df[df["file_name"] != file_name]
+
+            if not updated_df.empty:
+                self.cos_api.df_to_csv(df=updated_df, cos_filename=metadata_path, header=True)
+
+        except (OSError, pd.errors.ParserError) as e:
+            raise OSError("Failed to remove metadata from %s: %s", metadata_path, str(e)) from e
+
+    @staticmethod
+    def _create_empty_dataframe() -> pd.DataFrame:
+        """Create empty DataFrame with proper columns."""
+        columns = ["file_name", "url", "created_by", "last_modified", "nota_number", "language", "source"]
+        return pd.DataFrame(columns=columns)
+
+    @staticmethod
+    def _merge_metadata(existing_df: pd.DataFrame, new_entry: pd.DataFrame) -> pd.DataFrame:
+        """Merge new metadata entry with existing data."""
+        unique_cols = ["file_name", "source"]
+        mask = existing_df[unique_cols].eq(new_entry[unique_cols].iloc[0]).all(axis=1)
+
+        if not existing_df[mask].empty:
+            existing_df.update(new_entry)
+            return existing_df
+
+        logging.info("No update on medata file as nothing changed on it.")
+
+        return pd.concat([existing_df, new_entry], ignore_index=True)
+
+
+##Here is the test to be fixed
+
+from unittest.mock import Mock
+
+import pandas as pd
 import pytest
 
-from bnppf_rag_engine.rag_engine.sharepoint.authenticator import (
-    SharePointAuthenticator,
+from bnppf_rag_engine.rag_engine.sharepoint.metadata_manager import (
+    MetadataManager,
 )
 from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
-    AzureCredentials,
-    SharePointConfig,
+    DocumentMetadata,
 )
 
 
-class TestSharePointAuthenticator:
-    """Test SharePointAuthenticator class."""
+class TestMetadataManager:
+    """Test MetadataManager class."""
 
     @pytest.fixture
-    def mock_config(self):
-        """Create mock SharePoint config."""
-        return SharePointConfig(
-            crt_filepath="/path/to/cert.crt",
-            key_filepath="/path/to/key.key",
-            site_name="test_site",
-            site_base="https://test.sharepoint.com",
+    def mock_cos_api(self):
+        """Create mock COS API."""
+        return Mock()
+
+    @pytest.fixture
+    def metadata_manager(self, mock_cos_api):
+        """Create MetadataManager instance."""
+        return MetadataManager(mock_cos_api)
+
+    def test_get_metadata_by_filename_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for existing file."""
+        # Setup mock data
+        test_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
         )
 
-    @pytest.fixture
-    def mock_azure_creds(self):
-        """Create mock AzureCredentials."""
-        creds = Mock(spec=AzureCredentials)
-        creds.thumbprint = "test_thumbprint"
-        creds.client_id = "test_client_id"
-        creds.authority = "https://login.microsoftonline.com/test_tenant"
-        creds.scope = ["https://test.sharepoint.com/.default"]
-        return creds
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_get_client_creds_initialization(self, mock_from_env, mock_config, mock_azure_creds):
-        """Test client credentials are correctly created during initialization."""
-        mock_from_env.return_value = mock_azure_creds
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
 
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": "test_tenant"}):
-            authenticator = SharePointAuthenticator(mock_config)
+        # Verify the mock was called with correct parameters
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
 
-        creds = authenticator.azure_creds.client_creds
+        assert result["file_name"] == "test.docx"
+        assert result["url"] == "/test/test.docx"
 
-        assert creds["private_key"] == "file_content"
-        assert creds["thumbprint"] == "test_thumbprint"
-        assert creds["public_certificate"] == "file_content"
+    def test_get_metadata_by_filename_not_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for non-existing file."""
+        mock_cos_api.file_exists.return_value = False
 
-    @patch.dict(os.environ, {"PROXY": "http://proxy.example.com"})
-    def test_get_proxies_with_proxy(self):
-        """Test proxy configuration when PROXY env var is set."""
-        proxies = SharePointAuthenticator.get_proxies()
-        expected = {"http": "http://proxy.example.com", "https": "http://proxy.example.com"}
-        assert proxies == expected
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
 
-    @patch.dict(os.environ, {}, clear=True)
-    def test_get_proxies_without_proxy(self):
-        """Test proxy configuration when PROXY env var is not set."""
-        proxies = SharePointAuthenticator.get_proxies()
-        assert proxies == {}
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        # read_csv should not be called if file doesn't exist
+        mock_cos_api.read_csv.assert_not_called()
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.ConfidentialClientApplication")
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_get_access_token_success(self, mock_from_env, mock_app_class, mock_config, mock_azure_creds):
-        """Test successful token acquisition via the public get_access_token method."""
-        mock_from_env.return_value = mock_azure_creds
+        assert result is None
 
-        mock_app = Mock()
-        mock_app.acquire_token_for_client.return_value = {"access_token": "test_access_token"}
-        mock_app_class.return_value = mock_app
+    def test_get_metadata_by_filename_file_not_found(self, metadata_manager, mock_cos_api):
+        """Test getting metadata when file is not in CSV."""
+        test_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
+        )
 
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": "test_tenant"}):
-            authenticator = SharePointAuthenticator(mock_config)
-            token = authenticator.get_access_token()
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
 
-        assert token == "test_access_token"
-        mock_app.acquire_token_for_client.assert_called_once_with(scopes=mock_azure_creds.scope)
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.ConfidentialClientApplication")
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_get_access_token_error(self, mock_from_env, mock_app_class, mock_config, mock_azure_creds):
-        """Test token acquisition error via the public get_access_token method."""
-        mock_from_env.return_value = mock_azure_creds
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
 
-        mock_app = Mock()
-        mock_app.acquire_token_for_client.return_value = {"error": "invalid_client"}
-        mock_app_class.return_value = mock_app
+        assert result is None
 
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": "test_tenant"}):
-            authenticator = SharePointAuthenticator(mock_config)
-            with pytest.raises(ValueError, match="Error getting access token: %s"):
-                authenticator.get_access_token()
+    def test_get_metadata_by_filename_empty_data_error(self, metadata_manager, mock_cos_api):
+        """Test handling of EmptyDataError."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = pd.errors.EmptyDataError()
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    def test_initialization_missing_tenant_id(self, mock_from_env, mock_config):
-        """Test initialization fails when AZURE_TENANT_ID is missing."""
-        with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(KeyError):
-                SharePointAuthenticator(mock_config)
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
 
-    @patch("bnppf_rag_engine.rag_engine.sharepoint.authenticator.AzureCredentials.from_env")
-    @patch("builtins.open", mock_open(read_data="file_content"))
-    def test_initialization_empty_tenant_id(self, mock_from_env, mock_config, mock_azure_creds):
-        """Test initialization fails when AZURE_TENANT_ID is empty."""
-        mock_from_env.return_value = mock_azure_creds
-        
-        with patch.dict(os.environ, {"AZURE_TENANT_ID": ""}):
-            with pytest.raises(ValueError, match="AZURE_TENANT_ID environment variable is required"):
-                SharePointAuthenticator(mock_config)
+        assert result is None
+
+    def test_get_metadata_by_filename_key_error(self, metadata_manager, mock_cos_api):
+        """Test handling of KeyError."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = KeyError("file_name")
+
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
+
+        assert result is None
+
+    def test_write_metadata_new_file(self, metadata_manager, mock_cos_api):
+        """Test writing metadata for new CSV file."""
+        mock_cos_api.file_exists.return_value = False
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        # read_csv should not be called for new file
+        mock_cos_api.read_csv.assert_not_called()
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify the DataFrame passed to df_to_csv
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert df_arg.iloc[0]["file_name"] == "test.docx"
+        assert call_args.kwargs["cos_filename"] == "test_path.csv"
+        assert call_args.kwargs["header"] is True
+
+    def test_write_metadata_existing_file_new_entry(self, metadata_manager, mock_cos_api):
+        """Test writing metadata to existing CSV file with new entry."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "other_source",
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify the DataFrame has both entries
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert len(df_arg) == 2  # Should have both entries
+
+    def test_write_metadata_existing_file_update_entry(self, metadata_manager, mock_cos_api):
+        """Test updating existing metadata entry."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/old_url.docx",
+                    "created_by": "old_user@example.com",
+                    "last_modified": "2022-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "test_source",  # Same source and file_name
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/new_url.docx",
+            created_by="new_user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",  # Same source and file_name - should trigger update
+        )
+
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify the entry was updated, not added
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert len(df_arg) == 1  # Should still be 1 entry (updated, not added)
+
+    def test_write_metadata_os_error(self, metadata_manager, mock_cos_api):
+        """Test handling of OSError during write."""
+        mock_cos_api.file_exists.return_value = False
+        mock_cos_api.df_to_csv.side_effect = OSError("Permission denied")
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        with pytest.raises(OSError, match="Failed to write metadata to"):
+            metadata_manager.write_metadata(metadata, "test_path.csv")
+
+    def test_write_metadata_parser_error(self, metadata_manager, mock_cos_api):
+        """Test handling of ParserError during write."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = pd.errors.ParserError("Parsing error")
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        with pytest.raises(OSError, match="Failed to write metadata to"):
+            metadata_manager.write_metadata(metadata, "test_path.csv")
+
+    def test_remove_metadata(self, metadata_manager, mock_cos_api):
+        """Test removing metadata."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                },
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "other_source",
+                },
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify only the other.docx entry remains
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert len(df_arg) == 1
+        assert df_arg.iloc[0]["file_name"] == "other.docx"
+
+    def test_remove_metadata_file_not_exists(self, metadata_manager, mock_cos_api):
+        """Test removing metadata when CSV file doesn't exist."""
+        mock_cos_api.file_exists.return_value = False
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_not_called()
+        mock_cos_api.df_to_csv.assert_not_called()
+
+    def test_remove_metadata_empty_result(self, metadata_manager, mock_cos_api):
+        """Test removing metadata when result would be empty."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        # df_to_csv should not be called when result is empty
+        mock_cos_api.df_to_csv.assert_not_called()
+
+    def test_remove_metadata_os_error(self, metadata_manager, mock_cos_api):
+        """Test handling of OSError during remove."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = OSError("Permission denied")
+
+        with pytest.raises(OSError, match="Failed to remove metadata from"):
+            metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+    def test_remove_metadata_parser_error(self, metadata_manager, mock_cos_api):
+        """Test handling of ParserError during remove."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = pd.errors.ParserError("Parsing error")
+
+        with pytest.raises(OSError, match="Failed to remove metadata from"):
+            metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+    def test_create_empty_dataframe(self):
+        """Test creating empty DataFrame."""
+        df = MetadataManager._create_empty_dataframe()
+
+        expected_columns = ["file_name", "url", "created_by", "last_modified", "nota_number", "language", "source"]
+        assert list(df.columns) == expected_columns
+        assert len(df) == 0
+
+    def test_merge_metadata_new_entry(self):
+        """Test merging metadata with new entry."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "existing.docx",
+                    "url": "/test/existing.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "existing_source",
+                }
+            ]
+        )
+
+        new_entry = pd.DataFrame(
+            [
+                {
+                    "file_name": "new.docx",
+                    "url": "/test/new.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "new_source",
+                }
+            ]
+        )
+
+        result = MetadataManager._merge_metadata(existing_df, new_entry)
+
+        assert len(result) == 2
+        assert "existing.docx" in result["file_name"].values
+        assert "new.docx" in result["file_name"].values
+
+    def test_merge_metadata_update_entry(self):
+        """Test merging metadata with update to existing entry."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/old_url.docx",
+                    "created_by": "old_user@example.com",
+                    "last_modified": "2022-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "test_source",
+                }
+            ]
+        )
+
+        new_entry = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/new_url.docx",
+                    "created_by": "new_user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
+        )
+
+        result = MetadataManager._merge_metadata(existing_df, new_entry)
+
+        assert len(result) == 1
+        assert result.iloc[0]["url"] == "/test/new_url.docx"
+        assert result.iloc[0]["created_by"] == "new_user@example.com"

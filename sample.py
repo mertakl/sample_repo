@@ -1,124 +1,398 @@
-"""SharePointOrchestrator class."""
+##Original code;
+
+"""MetadataManager class."""
+
 import logging
-from collections import defaultdict
-from bnppf_rag_engine.config.config_handler import ConfigHandler
-from bnppf_rag_engine.rag_engine.sharepoint.db_manager import (
-    VectorDBManager,
-)
-from bnppf_rag_engine.rag_engine.sharepoint.document_processor import (
-    DocumentProcessor,
-)
-from bnppf_rag_engine.rag_engine.sharepoint.service import (
-    SharePointService,
-)
+from typing import Any
+
+import pandas as pd
+from bnppf_cos import CosBucketApi
+
 from bnppf_rag_engine.rag_engine.sharepoint.sharepoint_config import (
-    ProcessedDocument,
+    DocumentMetadata,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class SharePointOrchestrator:
-    """Main SharePoint client to orchestrate document processing and vector DB updates."""
+class MetadataManager:
+    """Manages CSV metadata operations."""
 
-    def __init__(
-        self,
-        sharepoint_service: SharePointService,
-        document_processor: DocumentProcessor,
-        vector_db_manager: VectorDBManager,
-        config_handler: ConfigHandler,
-    ):
-        """Initializes the orchestrator with dependency-injected services."""
-        self.sp_service = sharepoint_service
-        self.doc_processor = document_processor
-        self.db_manager = vector_db_manager
-        self.config_handler = config_handler
+    def __init__(self, cos_api: CosBucketApi):  # noqa: D107
+        self.cos_api = cos_api
 
-    async def run(self, project_args) -> None:
-        """Main execution method to run the entire synchronization process."""
-        # 1. Handle deleted files
-        self._handle_deleted_files()
-        
-        # 2. Process documents and find new/updated ones
-        newly_uploaded_by_lang = self._process_all_documents(project_args)
-        
-        # 3. Update Vector DB for each language that has new documents
-        await self._update_vector_db_for_languages(project_args, newly_uploaded_by_lang)
+    def get_metadata_by_filename(self, file_name: str, metadata_path: str) -> dict[str, Any] | None:
+        """Get metadata for specific file."""
+        if not self.cos_api.file_exists(metadata_path):
+            return None
 
-    def _handle_deleted_files(self) -> None:
-        """Handle deletion of files that were removed from SharePoint."""
-        deleted_files = self.sp_service.get_deleted_file_names()
-        if deleted_files:
-            for file_name in deleted_files:
-                self.doc_processor.delete_document(file_name=file_name)
+        try:
+            df = self.cos_api.read_csv(metadata_path, sep=";")
+            filtered_df = df[df["file_name"] == file_name]
+            return filtered_df.iloc[0].to_dict() if not filtered_df.empty else None
+        except (pd.errors.EmptyDataError, KeyError, IndexError):
+            return None
 
-    def _process_all_documents(self, project_args) -> defaultdict:
-        """Process all documents and return newly uploaded ones by language."""
-        all_documents_by_lang = self.sp_service.get_documents_by_language(["Documents"])
-        newly_uploaded_by_lang = defaultdict(list)
-        
-        for lang, sources in all_documents_by_lang.items():
-            new_docs_for_lang = self._process_documents_for_language(lang, sources, project_args)
-            newly_uploaded_by_lang[lang].extend(new_docs_for_lang)
-        
-        return newly_uploaded_by_lang
+    def write_metadata(self, metadata: DocumentMetadata, metadata_path: str) -> None:
+        """Write metadata to CSV file."""
+        try:
+            logger.info("Writing metadata information...")
+            if self.cos_api.file_exists(metadata_path):
+                existing_df = self.cos_api.read_csv(metadata_path, sep=";")
+            else:
+                existing_df = self._create_empty_dataframe()
 
-    def _process_documents_for_language(self, lang: str, sources: dict, project_args) -> list:
-        """Process documents for a specific language and return newly uploaded ones."""
-        newly_uploaded = []
-        
-        for source, doc_list in sources.items():
-            new_docs_for_source = self._process_documents_for_source(
-                lang, source, doc_list, project_args
-            )
-            newly_uploaded.extend(new_docs_for_source)
-        
-        return newly_uploaded
+            new_entry = pd.DataFrame([metadata.__dict__])
+            updated_df = self._merge_metadata(existing_df, new_entry)
 
-    def _process_documents_for_source(self, lang: str, source: str, doc_list: list, project_args) -> list:
-        """Process documents for a specific source and return newly uploaded ones."""
-        newly_uploaded = []
-        
-        for doc_data in doc_list:
-            processed_doc = ProcessedDocument(
-                file=doc_data["File"],
-                nota_number=doc_data.get("NotaNumber"),
-                source=source,
-                language=lang,
-            )
-            
-            was_uploaded, file_content = self.doc_processor.process_document(
-                doc=processed_doc, parsed_args=project_args
-            )
-            
-            if was_uploaded:
-                processed_doc.content = file_content
-                newly_uploaded.append(processed_doc)
-        
-        return newly_uploaded
+            self.cos_api.df_to_csv(df=updated_df, cos_filename=metadata_path, header=True)
 
-    async def _update_vector_db_for_languages(self, project_args, newly_uploaded_by_lang: defaultdict) -> None:
-        """Update vector database for all languages that have new documents."""
-        languages_to_process = self._get_languages_to_process(project_args)
-        
-        for lang in languages_to_process:
-            await self._update_vector_db_for_language(lang, newly_uploaded_by_lang, project_args)
+        except (OSError, pd.errors.ParserError) as e:
+            raise OSError("Failed to write metadata to %s: %s", metadata_path, str(e)) from e
 
-    async def _update_vector_db_for_language(self, lang: str, newly_uploaded_by_lang: defaultdict, project_args) -> None:
-        """Update vector database for a specific language."""
-        new_docs_for_lang = newly_uploaded_by_lang.get(lang)
-        if not new_docs_for_lang:
-            logger.info("No new documents to process for language: %s", lang)
+    def remove_metadata(self, metadata_path: str, file_name: str) -> None:
+        """Remove metadata for specific file."""
+        if not self.cos_api.file_exists(metadata_path):
             return
 
-        await self.db_manager.update_for_language(
-            language=lang, 
-            new_documents=new_docs_for_lang, 
-            project_name=project_args.project_name
+        try:
+            logger.info("Removing metadata information for %s...", file_name)
+
+            df = self.cos_api.read_csv(metadata_path, sep=";")
+            updated_df = df[df["file_name"] != file_name]
+
+            if not updated_df.empty:
+                self.cos_api.df_to_csv(df=updated_df, cos_filename=metadata_path, header=True)
+
+        except (OSError, pd.errors.ParserError) as e:
+            raise OSError("Failed to remove metadata from %s: %s", metadata_path, str(e)) from e
+
+    @staticmethod
+    def _create_empty_dataframe() -> pd.DataFrame:
+        """Create empty DataFrame with proper columns."""
+        columns = ["file_name", "url", "created_by", "last_modified", "nota_number", "language", "source"]
+        return pd.DataFrame(columns=columns)
+
+    @staticmethod
+    def _merge_metadata(existing_df: pd.DataFrame, new_entry: pd.DataFrame) -> pd.DataFrame:
+        """Merge new metadata entry with existing data."""
+        unique_cols = ["file_name", "source"]
+        mask = existing_df[unique_cols].eq(new_entry[unique_cols].iloc[0]).all(axis=1)
+
+        if not existing_df[mask].empty:
+            existing_df.update(new_entry)
+            return existing_df
+
+        logging.info("No update on medata file as nothing changed on it.")
+
+        return pd.concat([existing_df, new_entry], ignore_index=True)
+
+##Can you fix the test?
+
+
+class TestMetadataManager:
+    """Test MetadataManager class."""
+
+    @pytest.fixture
+    def mock_cos_api(self):
+        """Create mock COS API."""
+        return Mock()
+
+    @pytest.fixture
+    def metadata_manager(self, mock_cos_api):
+        """Create MetadataManager instance."""
+        return MetadataManager(mock_cos_api)
+
+    def test_get_metadata_by_filename_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for existing file."""
+        # Setup mock data
+        test_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
         )
 
-    def _get_languages_to_process(self, project_args) -> list[str]:
-        """Determines the list of languages to process based on arguments or config."""
-        if hasattr(project_args, "language") and project_args.language:
-            return [project_args.language]
-        return self.config_handler.get_config("languages")
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
+
+        # Fixed parameter order: file_name first, metadata_path second
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
+
+        # Verify the mock was called with correct parameters
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
+
+        assert result["file_name"] == "test.docx"
+        assert result["url"] == "/test/test.docx"
+
+    def test_get_metadata_by_filename_not_exists(self, metadata_manager, mock_cos_api):
+        """Test getting metadata for non-existing file."""
+        mock_cos_api.file_exists.return_value = False
+
+        # Fixed parameter order: file_name first, metadata_path second
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        # read_csv should not be called if file doesn't exist
+        mock_cos_api.read_csv.assert_not_called()
+
+        assert result is None
+
+    def test_get_metadata_by_filename_file_not_found(self, metadata_manager, mock_cos_api):
+        """Test getting metadata when file is not in CSV."""
+        test_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = test_df
+
+        # Fixed parameter order: file_name first, metadata_path second
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
+
+        assert result is None
+
+    def test_get_metadata_by_filename_empty_data_error(self, metadata_manager, mock_cos_api):
+        """Test handling of EmptyDataError."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = pd.errors.EmptyDataError()
+
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
+
+        assert result is None
+
+    def test_get_metadata_by_filename_key_error(self, metadata_manager, mock_cos_api):
+        """Test handling of KeyError."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = KeyError("file_name")
+
+        result = metadata_manager.get_metadata_by_filename("test.docx", "test_path.csv")
+
+        assert result is None
+
+    def test_write_metadata_new_file(self, metadata_manager, mock_cos_api):
+        """Test writing metadata for new CSV file."""
+        mock_cos_api.file_exists.return_value = False
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        # read_csv should not be called for new file
+        mock_cos_api.read_csv.assert_not_called()
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify the DataFrame passed to df_to_csv
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert df_arg.iloc[0]["file_name"] == "test.docx"
+        assert call_args.kwargs["cos_filename"] == "test_path.csv"
+        assert call_args.kwargs["header"] is True
+
+    def test_write_metadata_existing_file_new_entry(self, metadata_manager, mock_cos_api):
+        """Test writing metadata to existing CSV file with new entry."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "other_source",
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify the DataFrame has both entries
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert len(df_arg) == 2  # Should have both entries
+
+    def test_write_metadata_existing_file_update_entry(self, metadata_manager, mock_cos_api):
+        """Test updating existing metadata entry."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/old_url.docx",
+                    "created_by": "old_user@example.com",
+                    "last_modified": "2022-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "test_source",  # Same source and file_name
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/new_url.docx",
+            created_by="new_user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",  # Same source and file_name - should trigger update
+        )
+
+        metadata_manager.write_metadata(metadata, "test_path.csv")
+
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify the entry was updated, not added
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert len(df_arg) == 1  # Should still be 1 entry (updated, not added)
+
+    def test_write_metadata_os_error(self, metadata_manager, mock_cos_api):
+        """Test handling of OSError during write."""
+        mock_cos_api.file_exists.return_value = False
+        mock_cos_api.df_to_csv.side_effect = OSError("Permission denied")
+
+        metadata = DocumentMetadata(
+            file_name="test.docx",
+            url="/test/test.docx",
+            created_by="user@example.com",
+            last_modified="2023-01-01T00:00:00Z",
+            nota_number="123",
+            language="EN",
+            source="test_source",
+        )
+
+        with pytest.raises(OSError, match="Failed to write metadata to test_path.csv"):
+            metadata_manager.write_metadata(metadata, "test_path.csv")
+
+    def test_remove_metadata(self, metadata_manager, mock_cos_api):
+        """Test removing metadata."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                },
+                {
+                    "file_name": "other.docx",
+                    "url": "/test/other.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "456",
+                    "language": "FR",
+                    "source": "other_source",
+                },
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_called_once_with("test_path.csv", sep=";")
+        mock_cos_api.df_to_csv.assert_called_once()
+
+        # Verify only the other.docx entry remains
+        call_args = mock_cos_api.df_to_csv.call_args
+        df_arg = call_args.kwargs["df"]
+        assert len(df_arg) == 1
+        assert df_arg.iloc[0]["file_name"] == "other.docx"
+
+    def test_remove_metadata_file_not_exists(self, metadata_manager, mock_cos_api):
+        """Test removing metadata when CSV file doesn't exist."""
+        mock_cos_api.file_exists.return_value = False
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        mock_cos_api.file_exists.assert_called_once_with("test_path.csv")
+        mock_cos_api.read_csv.assert_not_called()
+        mock_cos_api.df_to_csv.assert_not_called()
+
+    def test_remove_metadata_empty_result(self, metadata_manager, mock_cos_api):
+        """Test removing metadata when result would be empty."""
+        existing_df = pd.DataFrame(
+            [
+                {
+                    "file_name": "test.docx",
+                    "url": "/test/test.docx",
+                    "created_by": "user@example.com",
+                    "last_modified": "2023-01-01T00:00:00Z",
+                    "nota_number": "123",
+                    "language": "EN",
+                    "source": "test_source",
+                }
+            ]
+        )
+
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.return_value = existing_df
+
+        metadata_manager.remove_metadata("test_path.csv", "test.docx")
+
+        # df_to_csv should not be called when result is empty
+        mock_cos_api.df_to_csv.assert_not_called()
+
+    def test_remove_metadata_os_error(self, metadata_manager, mock_cos_api):
+        """Test handling of OSError during remove."""
+        mock_cos_api.file_exists.return_value = True
+        mock_cos_api.read_csv.side_effect = OSError("Permission denied")
+
+        with pytest.raises(OSError, match="Failed to remove metadata from test_path.csv"):
+            metadata_manager.remove_metadata("test_path.csv", "test.docx")

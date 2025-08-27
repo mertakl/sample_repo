@@ -1,89 +1,29 @@
-##Here is the original code;
+import logging
+import socket
+import pytest
+from unittest.mock import Mock
+
+# Assuming your classes (KafkaLoggingHandlerLaas, LogClientLaas, etc.)
+# are in a module named `your_logging_module`.
+from your_logging_module import KafkaLoggingHandlerLaas, LogClientLaas
 
 
-class KafkaLoggingConfigLaas(LogClientConfig):
-    """
-    A model for log client configuration.
-    """
-
-    laas_retention: str = Field(default=Retention.MONTH.value)
-    level: str = Field(default="INFO")
-
-
-class KafkaLoggingHandlerLaas(BaseKafkaLoggingHandler):
-    """
-    A logging handler that captures logs and send them to LaaS (group's LaaS solution) log client.
-    """
-
-    def __init__(self, log_client_config: dict):
-        """
-        Initialize the KafkaLoggingHandler instance.
-
-        Args:
-        log_client_config(dict): Dictionary with log client configuration.
-        """
-        self.hostname = socket.gethostname()
-
-        log_client = self.get_log_client(log_client_config)
-        handler_config = self.get_handler_config(log_client_config)
-        super().__init__(handler_config, log_client)
-
-    def get_log_client(self, log_client_config: dict):
-        """
-        Create and return a LogClientLaas instance using the provided configuration.
-
-        Args:
-            log_client_config (dict): Dictionary with log client configuration.
-
-        Returns:
-            LogClientLaas: An instance of LogClientLaas configured with the provided settings.
-        """
-        handler_config = self.get_handler_config(log_client_config)
-        return LogClientLaas(handler_config)
-
-    def get_handler_config(self, log_client_config: dict):
-        """
-        Validate and return a KafkaLoggingConfigLaas instance using the provided configuration.
-
-        Args:
-            log_client_config (dict): Dictionary with log client configuration.
-
-        Returns:
-            KafkaLoggingConfigLaas: An instance of KafkaLoggingConfigLaas validated with the provided settings.
-        """
-        return KafkaLoggingConfigLaas.model_validate(log_client_config)
-
-    def send_log(self, record: logging.LogRecord):
-        """
-        Forwards the log safely to the kafka log client
-
-        Args:
-            record (logging.LogRecord): The log record to be sent.
-        """
-        try:
-            if self.log_client:
-                record.hostname = self.hostname
-                self.log_client.send_log(laas_retention=self.laas_retention, log=record.__dict__)
-        except Exception as ex:
-            logger.error(ex)
-            super().handleError(record)
-			
-#I  made a change for the hostname.I need you to update/enrich the test for it.
-
+## Fixtures
+# --------------------------------------------------------------------------
 
 @pytest.fixture
 def mock_log_client(mocker) -> Mock:
-    log_client_mock = mocker.Mock(spec=LogClientLaas)
-    log_client_mock.send_log.return_value = None
-    return log_client_mock
+    """A mock of the LogClientLaas to isolate the handler for testing."""
+    return mocker.Mock(spec=LogClientLaas)
 
 
 @pytest.fixture
 def test_config() -> dict[str, str]:
+    """Provides a standard dictionary for the log client configuration."""
     return {
         "auid": "ap12345",
         "code_name": "testcode",
-        "version": 1,
+        "version": "1.0",
         "data_set": "testlog",
         "event_type": "event",
         "kafka_topic": "test_topic",
@@ -91,42 +31,100 @@ def test_config() -> dict[str, str]:
     }
 
 
-def test_emit_should_send_logs_to_log_client(mocker, test_config, mock_log_client):
-    expected_record = logging.LogRecord(
-        name="bla", level=logging.INFO, pathname="", lineno=10, msg="This is a log message", args=None, exc_info=None
+@pytest.fixture
+def kafka_handler(mocker, test_config, mock_log_client) -> KafkaLoggingHandlerLaas:
+    """
+    A fixture that provides a fully initialized KafkaLoggingHandlerLaas
+    instance with a mocked log client, and handles cleanup.
+    """
+    mocker.patch.object(KafkaLoggingHandlerLaas, "get_log_client", return_value=mock_log_client)
+    handler = KafkaLoggingHandlerLaas(log_client_config=test_config)
+    yield handler
+    # Teardown: ensure the handler is properly closed after the test runs
+    handler.close()
+
+
+## Test Functions
+# --------------------------------------------------------------------------
+
+def test_send_log_adds_hostname_correctly(kafka_handler, mock_log_client):
+    """
+    ✅ Verifies that the handler correctly retrieves the machine's hostname and
+    adds it to the log record dictionary before sending it.
+    """
+    # Arrange
+    log_message = "This is a test log message"
+    log_record = logging.LogRecord(
+        name="test_logger", level=logging.INFO, pathname="/fake/path",
+        lineno=42, msg=log_message, args=None, exc_info=None
     )
+    expected_hostname = socket.gethostname()
 
-    mocker.patch.object(KafkaLoggingHandlerLaas, "get_log_client", return_value=mock_log_client)
-    handler = KafkaLoggingHandlerLaas(test_config)
+    # Act
+    # The handler's `emit` method will call the `send_log` method internally
+    kafka_handler.emit(log_record)
 
-    handler.emit(expected_record)
-    time.sleep(0.1)
-    handler.close()
-
+    # Assert
     mock_log_client.send_log.assert_called_once()
-    # Check if the hostname is correctly added to the log record
-    assert mock_log_client.send_log.call_args[1]["log"]["hostname"] == socket.gethostname()
+
+    # For clearer assertions, capture the keyword arguments passed to the mock
+    _, kwargs = mock_log_client.send_log.call_args
+    sent_log_dict = kwargs.get("log")
+
+    assert sent_log_dict is not None, "The log dictionary was not sent."
+    assert "hostname" in sent_log_dict, "The 'hostname' key is missing from the log record."
+    assert sent_log_dict["hostname"] == expected_hostname
+    assert sent_log_dict["msg"] == log_message
 
 
-def test_close_should_cleanup_log_client(mocker, test_config, mock_log_client):
-    mocker.patch.object(KafkaLoggingHandlerLaas, "get_log_client", return_value=mock_log_client)
-    handler = KafkaLoggingHandlerLaas(test_config)
+def test_handler_initialization_fails_if_hostname_cannot_be_resolved(mocker, test_config):
+    """
+    EDGE CASE: Verifies that the handler's __init__ method raises an exception
+    if `socket.gethostname()` fails, preventing an invalid handler state.
+    """
+    # Arrange
+    error_message = "Could not resolve hostname"
+    mocker.patch("socket.gethostname", side_effect=socket.gaierror(error_message))
 
-    handler.close()
+    # Act & Assert
+    with pytest.raises(socket.gaierror, match=error_message):
+        KafkaLoggingHandlerLaas(log_client_config=test_config)
 
+
+def test_close_should_cleanup_log_client(kafka_handler, mock_log_client):
+    """
+    Verifies that calling close() on the handler also closes the underlying
+    log client and sets it to None.
+    """
+    # Act
+    kafka_handler.close()
+
+    # Assert
     mock_log_client.close.assert_called_once()
-    assert handler.log_client is None
+    assert kafka_handler.log_client is None
 
 
-def test_exception_with_stacktrace(mocker, test_config, mock_log_client):
-    mocker.patch.object(KafkaLoggingHandlerLaas, "get_log_client", return_value=mock_log_client)
-    handler = KafkaLoggingHandlerLaas(test_config)
+def test_exception_with_stacktrace_is_handled(kafka_handler, mock_log_client):
+    """
+    Verifies that logs containing exception information are processed
+    without raising a pickling error for the traceback object.
+    """
+    # Arrange
+    logger = logging.getLogger("test_exception_logger")
+    logger.propagate = False  # Prevent log from propagating to root logger
+    logger.handlers.clear()
+    logger.addHandler(kafka_handler)
 
-    logger = logging.getLogger("test_exception_with_stacktrace")
-    logger.addHandler(handler)
-
-    # this should not print a TypeError: cannot pickle 'traceback' object  (hard to catch automatically, check your screen)
+    # Act
     try:
-        raise ValueError("We have a problem with a stack trace")
+        raise ValueError("This is a test exception.")
     except ValueError as e:
-        logger.error("exception with stack trace %s", e, exc_info=e)
+        logger.error("An exception occurred: %s", e, exc_info=True)
+
+    # Assert
+    mock_log_client.send_log.assert_called_once()
+    _, kwargs = mock_log_client.send_log.call_args
+    sent_log_dict = kwargs.get("log")
+
+    assert "exc_info" in sent_log_dict
+    assert sent_log_dict["exc_info"] is not None

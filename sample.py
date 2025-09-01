@@ -85,7 +85,7 @@ async def generate_llm_answer_stream(self, conversation: Conversation, user_id: 
         user_id: id of the user
         
     Yields:
-        SamyOutput: Streaming SamyOutput objects
+        SamyOutput: First yields the response, then yields confidence score separately
     """
     enhanced_assistant_response = await self.conversational_assistant.next_message(
         conversation=conversation, user_id=user_id
@@ -100,7 +100,6 @@ async def generate_llm_answer_stream(self, conversation: Conversation, user_id: 
                 enhanced_assistant_response.content,
             ]
         )
-        confidence_score = None
     else:
         content = "\n".join(
             [
@@ -108,21 +107,32 @@ async def generate_llm_answer_stream(self, conversation: Conversation, user_id: 
                 retriever_config["further_detail_message"][self.language],
             ]
         )
-        # Calculate the confidence score for non-keyword searches
-        confidence_score = await build_confidence_score(
-            question=conversation.messages[-1].content,
-            references=enhanced_assistant_response.references,
-            answer=content,  # Use the final content with the appended message
-            config_handler=self.config_handler,
-            language=self.language,
-            llm=self.llm_confidence_score,
-        )
 
-    # Create and yield SamyOutput
+    # FIRST: Yield the response immediately (without confidence score)
     yield SamyOutput(
         prompt=enhanced_assistant_response.prompt,
         keyword_search=enhanced_assistant_response.keyword_search,
         references=enhanced_assistant_response.references,
         content=content,
-        confidence_score=confidence_score,
+        confidence_score=None,  # Will be sent separately
     )
+
+    # SECOND: Calculate and yield confidence score (only for non-keyword searches)
+    if not enhanced_assistant_response.keyword_search:
+        confidence_score = await build_confidence_score(
+            question=conversation.messages[-1].content,
+            references=enhanced_assistant_response.references,
+            answer=content,
+            config_handler=self.config_handler,
+            language=self.language,
+            llm=self.llm_confidence_score,
+        )
+        
+        # Yield another SamyOutput with the confidence score
+        yield SamyOutput(
+            prompt=None,  # Already sent in first packet
+            keyword_search=None,  # Already sent in first packet
+            references=None,  # Already sent in first packet
+            content=None,  # Already sent in first packet
+            confidence_score=confidence_score,
+        )

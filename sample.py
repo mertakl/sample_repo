@@ -1,214 +1,287 @@
-##In this code;
+import logging
+from functools import cached_property
+from typing import AsyncGenerator
 
-class SamyOutput(EnhancedAssistantResponse):
-    """Output of Yara Samy with confidence score."""
-
-    confidence_score: ConfidenceScore | None
+from .base import Assistant
+from .config import ConfigHandler
+from .types import (
+    AVAILABLE_LANGUAGES_TYPE,
+    Conversation,
+    Message,
+    MessageRole,
+    Metadata,
+    UserMessage,
+    YaraSamyResponse,
+)
+from .utils import (
+    build_confidence_score,
+    get_conversational_assistant,
+    get_language_model_from_service,
+    is_at_doc,
+    is_nota,
+    load_nota_url_from_cos,
+    pretty_at_doc,
+    pretty_nota_search,
+    strip_at_doc,
+)
 
 
 class YaraSamyAssistant(Assistant, arbitrary_types_allowed=True):
-    """Yara for Samy Assistant."""
+    """Yara for Samy Assistant - handles various query types including NOTA, @doc, and LLM responses."""
 
     config_handler: ConfigHandler
     language: AVAILABLE_LANGUAGES_TYPE
 
     @cached_property
     def nota_url_mapping(self) -> dict[str, list[str]]:
-        """Nota URL mapping given the language and configuration."""
-        return load_nota_url_from_cos(language=self.language, config_handler=self.config_handler)
+        """Load NOTA URL mapping for the configured language."""
+        return load_nota_url_from_cos(
+            language=self.language, 
+            config_handler=self.config_handler
+        )
 
     @cached_property
     def conversational_assistant(self) -> FortisConversationalAssistant:
-        """Underlying conversational assistant."""
-        return get_conversational_assistant(config_handler=self.config_handler, language=self.language)
+        """Get the underlying conversational assistant."""
+        return get_conversational_assistant(
+            config_handler=self.config_handler, 
+            language=self.language
+        )
 
     @cached_property
     def llm_confidence_score(self) -> LanguageModel:
-        """LanguageModel for confidence score."""
+        """Get language model for confidence score evaluation."""
         llm_config = self.config_handler.get_config("evaluation_llm_model")
         return get_language_model_from_service(
-            service=llm_config["service"], model_name=llm_config["name"], rpm=llm_config.get("rpm_limit")
+            service=llm_config["service"],
+            model_name=llm_config["name"],
+            rpm=llm_config.get("rpm_limit")
         )
 
-    def load_cached_properties(self):
-        """Computes cached properties."""
-        logging.info("%s nota mappings loaded.", len(self.nota_url_mapping.keys()))
-        logging.info("Loaded underlying %s", type(self.conversational_assistant).__name__)
-        logging.info("Loaded underlying %s", type(self.llm_confidence_score).__name__)
+    def load_cached_properties(self) -> None:
+        """Pre-load cached properties and log initialization info."""
+        logging.info("Loaded %d NOTA mappings", len(self.nota_url_mapping))
+        logging.info("Loaded %s", type(self.conversational_assistant).__name__)
+        logging.info("Loaded %s", type(self.llm_confidence_score).__name__)
 
-    async def next_message(self, conversation: Conversation, user_id: str) -> SamyOutput:  # pylint: disable=W0221
-        """Generates SamyOutput."""
-        raise NotImplementedError
+    async def next_message(self, conversation: Conversation, user_id: str) -> YaraSamyResponse:
+        """Generate YaraSamyResponse - not implemented for streaming version."""
+        raise NotImplementedError("Use next_message_stream for streaming responses")
 
-    async def next_message_stream(self, conversation: Conversation, user_id: str) -> AsyncGenerator[SamyOutput, None]: # pylint: disable=W0221
-        """Generates a streaming response for all cases (nota, @doc, and LLM answers).
-
+    async def next_message_stream(
+        self, 
+        conversation: Conversation, 
+        user_id: str
+    ) -> AsyncGenerator[YaraSamyResponse, None]:
+        """Generate streaming response based on query type.
+        
+        Handles three types of queries:
+        1. NOTA queries - return matching documents
+        2. @doc queries - return document links without LLM processing
+        3. Regular queries - full RAG with LLM response
+        
         Args:
-            conversation: conversation history of user and assistant
-            user_id: ID of the user for SSO filtering
-
+            conversation: Chat history between user and assistant
+            user_id: User identifier for SSO filtering
+            
         Yields:
-            SamyOutput: Streaming SamyOutput objects
+            YaraSamyResponse: Streaming response objects
         """
-        query = conversation.messages[-1]
-        assert isinstance(query, UserMessage)
-        # For now, we don't use user_id. It's a placeholder for SSO information.
-        assert user_id, "user_id is not given."
-
+        query = self._validate_and_extract_query(conversation, user_id)
+        
+        # Handle empty input
         if not query.content.strip():
-            # The input is empty - yield single response
-            content = self.config_handler.get_config("empty_input_message")[self.language]
-            yield SamyOutput(
-                prompt=None,
-                keyword_search=None,
-                references=None,
-                content=content,
-                confidence_score=None,
-            )
+            yield self._create_empty_input_response()
             return
 
-        # When a user asks a question with just a nota, we return the docs matching to that nota
+        # Handle NOTA queries
         if is_nota(query.content.strip()):
-            content = pretty_nota_search(nota=query.content.strip(), nota_url_mapping=self.nota_url_mapping)
-            yield SamyOutput(
-                prompt=None,
-                keyword_search=None,
-                references=None,
-                content=content,
-                confidence_score=None,
-            )
+            yield self._create_nota_response(query.content.strip())
             return
 
-        # When a user uses the @doc functionality, we return links to document without final LLM call
+        # Handle @doc queries
         if is_at_doc(query.content):
-            content = strip_at_doc(message=query.content)
-            if not content.strip():
-                content = self.config_handler.get_config("empty_doc_input_message")[self.language]
-                yield SamyOutput(
-                    prompt=None,
-                    keyword_search=None,
-                    references=None,
-                    content=content,
-                    confidence_score=None,
-                )
-                return
-
-            # Update the conversation with stripped content
-            conversation.messages[-1] = UserMessage(content=content, id=conversation.messages[-1].id)
-            _, retrieval_result = await self.conversational_assistant.retrieval_result(
-                conversation_window=self.conversational_assistant.get_conversation_window(conversation=conversation)
-            )
-
-            content = pretty_at_doc(
-                [
-                    query_response.chunk.metadata.get("urls", ["No URL found for this document."])
-                    for query_response in retrieval_result
-                ]
-            )
-
-            yield SamyOutput(
-                prompt=None,
-                keyword_search=None,
-                references=None,
-                content=content,
-                confidence_score=None,
-            )
+            async for response in self._handle_doc_query(conversation, query):
+                yield response
             return
 
-        # Classic RAG question or keyword search that requires an LLM call to generate the answer
-        async for samy_output in self.generate_llm_answer_stream(conversation=conversation, user_id=user_id):
-            yield samy_output
+        # Handle regular LLM queries
+        async for response in self.generate_llm_answer_stream(conversation, user_id):
+            yield response
 
-    async def generate_llm_answer_stream(self, conversation: Conversation, user_id: str) -> AsyncGenerator[SamyOutput, None]:
-        """Get the final chat response and references in streaming format.
+    def _validate_and_extract_query(self, conversation: Conversation, user_id: str) -> UserMessage:
+        """Validate inputs and extract the user query."""
+        if not user_id:
+            raise ValueError("user_id is required")
+            
+        query = conversation.messages[-1]
+        if not isinstance(query, UserMessage):
+            raise TypeError("Last message must be a UserMessage")
+            
+        return query
 
+    def _create_empty_input_response(self) -> YaraSamyResponse:
+        """Create response for empty input."""
+        content = self.config_handler.get_config("empty_input_message")[self.language]
+        return YaraSamyResponse(
+            message=Message(role=MessageRole.ASSISTANT, content=content),
+            metadata=self._create_empty_metadata()
+        )
+
+    def _create_nota_response(self, nota_query: str) -> YaraSamyResponse:
+        """Create response for NOTA queries."""
+        content = pretty_nota_search(
+            nota=nota_query, 
+            nota_url_mapping=self.nota_url_mapping
+        )
+        return YaraSamyResponse(
+            message=Message(role=MessageRole.ASSISTANT, content=content),
+            metadata=self._create_empty_metadata()
+        )
+
+    async def _handle_doc_query(
+        self, 
+        conversation: Conversation, 
+        query: UserMessage
+    ) -> AsyncGenerator[YaraSamyResponse, None]:
+        """Handle @doc functionality queries."""
+        content = strip_at_doc(message=query.content)
+        
+        if not content.strip():
+            yield self._create_empty_doc_response()
+            return
+
+        # Update conversation with stripped content
+        updated_conversation = self._update_conversation_with_stripped_content(
+            conversation, query, content
+        )
+        
+        # Get document URLs
+        _, retrieval_result = await self.conversational_assistant.retrieval_result(
+            conversation_window=self.conversational_assistant.get_conversation_window(
+                conversation=updated_conversation
+            )
+        )
+
+        doc_urls = [
+            query_response.chunk.metadata.get("urls", ["No URL found for this document."])
+            for query_response in retrieval_result
+        ]
+        
+        response_content = pretty_at_doc(doc_urls)
+        
+        yield YaraSamyResponse(
+            message=Message(role=MessageRole.ASSISTANT, content=response_content),
+            metadata=self._create_empty_metadata()
+        )
+
+    def _create_empty_doc_response(self) -> YaraSamyResponse:
+        """Create response for empty @doc input."""
+        content = self.config_handler.get_config("empty_doc_input_message")[self.language]
+        return YaraSamyResponse(
+            message=Message(role=MessageRole.ASSISTANT, content=content),
+            metadata=self._create_empty_metadata()
+        )
+
+    def _update_conversation_with_stripped_content(
+        self, 
+        conversation: Conversation, 
+        query: UserMessage, 
+        content: str
+    ) -> Conversation:
+        """Create updated conversation with stripped @doc content."""
+        updated_conversation = conversation.copy()
+        updated_conversation.messages[-1] = UserMessage(content=content, id=query.id)
+        return updated_conversation
+
+    async def generate_llm_answer_stream(
+        self, 
+        conversation: Conversation, 
+        user_id: str
+    ) -> AsyncGenerator[YaraSamyResponse, None]:
+        """Generate LLM-powered response with confidence scoring.
+        
         Args:
-            conversation: conversation history
-            user_id: id of the user
-
+            conversation: Chat history
+            user_id: User identifier
+            
         Yields:
-            SamyOutput: First yields the response, then yields confidence score separately
+            YaraSamyResponse: First the main response, then confidence score update
         """
-        enhanced_assistant_response = await self.conversational_assistant.next_message(
-            conversation=conversation, user_id=user_id
-        )
-        retriever_config = self.config_handler.get_config("retriever")
-
-        # Prepare the content based on keyword_search flag
-        if enhanced_assistant_response.keyword_search:
-            content = "\n".join(
-                [
-                    retriever_config["keyword_detected"][self.language],
-                    enhanced_assistant_response.content,
-                ]
-            )
-        else:
-            content = "\n".join(
-                [
-                    enhanced_assistant_response.content,
-                    retriever_config["further_detail_message"][self.language],
-                ]
-            )
-
-        # Yield the response immediately (without confidence score)
-        yield SamyOutput(
-            prompt=enhanced_assistant_response.prompt,
-            keyword_search=enhanced_assistant_response.keyword_search,
-            references=enhanced_assistant_response.references,
-            content=content,
-            confidence_score=None,  # Will be sent separately
+        # Get enhanced response from conversational assistant
+        enhanced_response = await self.conversational_assistant.next_message(
+            conversation=conversation, 
+            user_id=user_id
         )
 
-        # Calculate and yield confidence score
-        if not enhanced_assistant_response.keyword_search:
-            confidence_score = await build_confidence_score(
+        # Format response content
+        content = self._format_response_content(enhanced_response)
+
+        # Yield main response
+        yield YaraSamyResponse(
+            message=Message(role=MessageRole.ASSISTANT, content=content),
+            metadata=Metadata(
+                confidence_score=None,  # Sent separately
+                prompt=enhanced_response.prompt,
+                keyword_search=enhanced_response.keyword_search,
+                references=enhanced_response.references,
+            )
+        )
+
+        # Calculate and yield confidence score for non-keyword searches
+        if not enhanced_response.keyword_search:
+            confidence_score = await self._calculate_confidence_score(
                 question=conversation.messages[-1].content,
-                references=enhanced_assistant_response.references,
-                answer=content,
-                config_handler=self.config_handler,
-                language=self.language,
-                llm=self.llm_confidence_score,
+                references=enhanced_response.references,
+                answer=content
             )
 
-            # Yield SamyOutput with the confidence score
-            yield SamyOutput(
-                prompt=None,  # Already sent in first packet
-                keyword_search=None,  # Already sent in first packet
-                references=None,  # Already sent in first packet
-                content=None,  # Already sent in first packet
-                confidence_score=confidence_score,
+            yield YaraSamyResponse(
+                message=Message(role=MessageRole.ASSISTANT, content=""),
+                metadata=Metadata(
+                    confidence_score=confidence_score,
+                    prompt=None,
+                    keyword_search=False,
+                    references=None,
+                )
             )
-			
-Instead of SamyOutput, I want to return YaraSamyResponse
 
-class Message(ConfiguredBaseModel):
-    """Message schema."""
+    def _format_response_content(self, enhanced_response) -> str:
+        """Format the response content based on search type."""
+        retriever_config = self.config_handler.get_config("retriever")
+        
+        if enhanced_response.keyword_search:
+            return "\n".join([
+                retriever_config["keyword_detected"][self.language],
+                enhanced_response.content,
+            ])
+        else:
+            return "\n".join([
+                enhanced_response.content,
+                retriever_config["further_detail_message"][self.language],
+            ])
 
-    role: MessageRole
-    content: str
+    async def _calculate_confidence_score(
+        self, 
+        question: str, 
+        references, 
+        answer: str
+    ) -> float:
+        """Calculate confidence score for the response."""
+        return await build_confidence_score(
+            question=question,
+            references=references,
+            answer=answer,
+            config_handler=self.config_handler,
+            language=self.language,
+            llm=self.llm_confidence_score,
+        )
 
-    def to_rag_toolbox(self) -> RTMessage:
-        """Helper: convert to RAG-Toolbox object."""
-        match self.role:
-            case MessageRole.SYSTEM:
-                return SystemMessage(content=self.content)
-            case MessageRole.ASSISTANT:
-                return AssistantMessage(content=self.content)
-            case MessageRole.USER:
-                return UserMessage(content=self.content)
-            case _:
-                raise NotImplementedError
-
-
-class Metadata(ConfiguredBaseModel):
-    confidence_score: ConfidenceScore
-    prompt: Prompt | None
-    keyword_search: bool
-    references: list[DocumentChunk] | None | None
-
-
-class YaraSamyResponse(ConfiguredBaseModel):
-    """Yara for Samy API Response Schema."""
-
-    message: Message
-    metadata: Metadata
+    def _create_empty_metadata(self) -> Metadata:
+        """Create empty metadata object."""
+        return Metadata(
+            confidence_score=None,
+            prompt=None,
+            keyword_search=False,
+            references=None,
+        )

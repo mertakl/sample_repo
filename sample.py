@@ -1,4 +1,4 @@
-async def next_message_stream(self, conversation: Conversation, user_id: str) -> AsyncGenerator[dict, None]:
+async def next_message_stream(self, conversation: Conversation, user_id: str) -> AsyncGenerator[SamyOutput, None]:
     """Generates a streaming response for all cases (nota, @doc, and LLM answers).
     
     Args:
@@ -6,7 +6,7 @@ async def next_message_stream(self, conversation: Conversation, user_id: str) ->
         user_id: ID of the user for SSO filtering
         
     Yields:
-        dict: Streaming packets containing response and/or metadata
+        SamyOutput: Streaming SamyOutput objects
     """
     query = conversation.messages[-1]
     assert isinstance(query, UserMessage)
@@ -16,39 +16,25 @@ async def next_message_stream(self, conversation: Conversation, user_id: str) ->
     if not query.content.strip():
         # The input is empty - yield single response
         content = self.config_handler.get_config("empty_input_message")[self.language]
-        response_packet = {
-            "response": Message(role=MessageRole.ASSISTANT, content=content).model_dump()
-        }
-        yield response_packet
-        
-        # Yield metadata packet
-        metadata = Metadata(
-            confidence_score=None,
+        yield SamyOutput(
             prompt=None,
             keyword_search=None,
             references=None,
+            content=content,
+            confidence_score=None,
         )
-        metadata_packet = {"metadata": metadata.model_dump()}
-        yield metadata_packet
         return
 
     # When a user asks a question with just a nota, we return the docs matching to that nota
     if is_nota(query.content.strip()):
         content = pretty_nota_search(nota=query.content.strip(), nota_url_mapping=self.nota_url_mapping)
-        response_packet = {
-            "response": Message(role=MessageRole.ASSISTANT, content=content).model_dump()
-        }
-        yield response_packet
-        
-        # Yield metadata packet
-        metadata = Metadata(
-            confidence_score=None,
+        yield SamyOutput(
             prompt=None,
             keyword_search=None,
             references=None,
+            content=content,
+            confidence_score=None,
         )
-        metadata_packet = {"metadata": metadata.model_dump()}
-        yield metadata_packet
         return
 
     # When a user uses the @doc functionality, we return links to document without final LLM call
@@ -56,20 +42,13 @@ async def next_message_stream(self, conversation: Conversation, user_id: str) ->
         content = strip_at_doc(message=query.content)
         if not content.strip():
             content = self.config_handler.get_config("empty_doc_input_message")[self.language]
-            response_packet = {
-                "response": Message(role=MessageRole.ASSISTANT, content=content).model_dump()
-            }
-            yield response_packet
-            
-            # Yield metadata packet
-            metadata = Metadata(
-                confidence_score=None,
+            yield SamyOutput(
                 prompt=None,
                 keyword_search=None,
                 references=None,
+                content=content,
+                confidence_score=None,
             )
-            metadata_packet = {"metadata": metadata.model_dump()}
-            yield metadata_packet
             return
             
         # Update the conversation with stripped content
@@ -85,27 +64,20 @@ async def next_message_stream(self, conversation: Conversation, user_id: str) ->
             ]
         )
         
-        response_packet = {
-            "response": Message(role=MessageRole.ASSISTANT, content=content).model_dump()
-        }
-        yield response_packet
-        
-        # Yield metadata packet
-        metadata = Metadata(
-            confidence_score=None,
+        yield SamyOutput(
             prompt=None,
             keyword_search=None,
             references=None,
+            content=content,
+            confidence_score=None,
         )
-        metadata_packet = {"metadata": metadata.model_dump()}
-        yield metadata_packet
         return
 
     # Classic RAG question or keyword search that requires an LLM call to generate the answer
-    async for packet in self.generate_llm_answer_stream(conversation=conversation, user_id=user_id):
-        yield packet
+    async for samy_output in self.generate_llm_answer_stream(conversation=conversation, user_id=user_id):
+        yield samy_output
 
-async def generate_llm_answer_stream(self, conversation: Conversation, user_id: str) -> AsyncGenerator[dict, None]:
+async def generate_llm_answer_stream(self, conversation: Conversation, user_id: str) -> AsyncGenerator[SamyOutput, None]:
     """Get the final chat response and references in streaming format.
 
     Args:
@@ -113,7 +85,7 @@ async def generate_llm_answer_stream(self, conversation: Conversation, user_id: 
         user_id: id of the user
         
     Yields:
-        dict: Streaming packets containing response and metadata
+        SamyOutput: Streaming SamyOutput objects
     """
     enhanced_assistant_response = await self.conversational_assistant.next_message(
         conversation=conversation, user_id=user_id
@@ -128,6 +100,7 @@ async def generate_llm_answer_stream(self, conversation: Conversation, user_id: 
                 enhanced_assistant_response.content,
             ]
         )
+        confidence_score = None
     else:
         content = "\n".join(
             [
@@ -135,34 +108,21 @@ async def generate_llm_answer_stream(self, conversation: Conversation, user_id: 
                 retriever_config["further_detail_message"][self.language],
             ]
         )
-
-    # Update the content in the response object for later use
-    enhanced_assistant_response.content = content
-
-    # Create and yield response packet
-    response_packet = {
-        "response": Message(role=MessageRole.ASSISTANT, content=content).model_dump()
-    }
-    yield response_packet
-
-    # Calculate the confidence score (only for non-keyword searches)
-    confidence_score = None
-    if not enhanced_assistant_response.keyword_search:
+        # Calculate the confidence score for non-keyword searches
         confidence_score = await build_confidence_score(
             question=conversation.messages[-1].content,
             references=enhanced_assistant_response.references,
-            answer=enhanced_assistant_response.content,
+            answer=content,  # Use the final content with the appended message
             config_handler=self.config_handler,
             language=self.language,
             llm=self.llm_confidence_score,
         )
 
-    # Prepare and yield metadata packet
-    metadata = Metadata(
-        confidence_score=confidence_score,
+    # Create and yield SamyOutput
+    yield SamyOutput(
         prompt=enhanced_assistant_response.prompt,
         keyword_search=enhanced_assistant_response.keyword_search,
         references=enhanced_assistant_response.references,
+        content=content,
+        confidence_score=confidence_score,
     )
-    metadata_packet = {"metadata": metadata.model_dump()}
-    yield metadata_packet

@@ -1,274 +1,172 @@
-import json
-import logging
-from typing import Dict, Optional, Tuple
-
-from channels.http import AsyncHttpConsumer
-from django.http import HttpResponse
-
-from .config import get_or_raise_config, SAMY_EMP, LLMHUB
-from .llm_setup import setup_llmhub_connection
-from .vector_db import drop_and_resetup_vector_db
-from .assistants import get_guarded_yara_samy_assistant, GuardedAssistant
-from .serializers import RAGRequestSerializer
-from .types import AVAILABLE_LANGUAGES_TYPE, MessageRole, XBotMode
-from .utils import convert_to_RT_format, should_avoid_guardrails
-from .models import Conversation
+In the following process;
 
 
-class AppInitializer:
-    """Handles application initialization and setup."""
-    
-    def __init__(self):
-        self.config_handler = None
-        self.assistants: Dict[AVAILABLE_LANGUAGES_TYPE, GuardedAssistant] = {}
-    
-    def initialize(self) -> None:
-        """Initialize the application components."""
-        logging.basicConfig(level=logging.INFO)
-        
-        self.config_handler = get_or_raise_config(SAMY_EMP)
-        self._setup_llm_connection()
-        self._setup_vector_db()
-        self._initialize_assistants()
-        self._load_cached_properties()
-    
-    def _setup_llm_connection(self) -> None:
-        """Set up LLM connection if required."""
-        if self.config_handler.get_config("llm_model")["service"] == LLMHUB:
-            setup_llmhub_connection(project_name=SAMY_EMP)
-    
-    def _setup_vector_db(self) -> None:
-        """Set up vector database if localhost is detected."""
-        vector_db_config = self.config_handler.get_config("vector_db")
-        if "localhost" in vector_db_config["db_host"]:
-            drop_and_resetup_vector_db(vector_db_config)
-    
-    def _initialize_assistants(self) -> None:
-        """Initialize assistants for all configured languages."""
-        languages = self.config_handler.get_config("languages")
-        self.assistants = {
-            lang: get_guarded_yara_samy_assistant(language=lang) 
-            for lang in languages
-        }
-    
-    def _load_cached_properties(self) -> None:
-        """Load cached properties for all assistants."""
-        for assistant in self.assistants.values():
-            assistant.underlying_assistant.load_cached_properties()
+def _process_documents_for_source(self, lang: str, source: str, doc_list: list, project_args) -> list:
+        """Process documents for a specific source and return newly uploaded ones."""
+        newly_uploaded = []
 
-
-class RequestValidator:
-    """Handles request validation and header processing."""
-    
-    @staticmethod
-    def validate_request_data(body: bytes) -> Tuple[bool, Optional[dict], Optional[str]]:
-        """
-        Validate request data.
-        
-        Returns:
-            Tuple of (is_valid, validated_data, error_message)
-        """
-        try:
-            request_data = json.loads(body.decode("utf-8"))
-            serializer = RAGRequestSerializer(data=request_data)
-            
-            if not serializer.is_valid():
-                return False, None, json.dumps({"error": serializer.errors})
-            
-            return True, serializer.validated_data, None
-            
-        except json.JSONDecodeError as e:
-            return False, None, json.dumps({"error": f"Invalid JSON: {str(e)}"})
-        except Exception as e:
-            return False, None, json.dumps({"error": f"Validation error: {str(e)}"})
-    
-    @staticmethod
-    def extract_and_validate_headers(headers) -> Tuple[bool, Optional[dict], Optional[str]]:
-        """
-        Extract and validate headers.
-        
-        Returns:
-            Tuple of (is_valid, headers_dict, error_message)
-        """
-        try:
-            decoded_headers = {
-                key.decode("utf-8"): value.decode("utf-8") 
-                for key, value in headers
-            }
-            
-            language = decoded_headers.get("language")
-            if not language or language not in AVAILABLE_LANGUAGES_TYPE.__args__:
-                return False, None, json.dumps({
-                    "error": "Language is missing or unsupported. Supported languages are nl and fr"
-                })
-            
-            x_bot_mode = decoded_headers.get("x-bot-mode", XBotMode.default)
-            
-            return True, {
-                "language": language,
-                "x_bot_mode": x_bot_mode
-            }, None
-            
-        except Exception as e:
-            return False, None, json.dumps({"error": f"Header validation error: {str(e)}"})
-
-
-class ResponseHandler:
-    """Handles response generation and streaming."""
-    
-    def __init__(self, consumer: AsyncHttpConsumer):
-        self.consumer = consumer
-    
-    async def send_error_response(self, status_code: int, error_message: str) -> None:
-        """Send an error response."""
-        await self.consumer.send_response(
-            status_code,
-            error_message.encode("utf-8"),
-            content_type="application/json"
-        )
-    
-    async def send_streaming_headers(self) -> None:
-        """Send headers for streaming response."""
-        await self.consumer.send_headers(
-            headers=[
-                (b"Content-Type", b"text/event-stream"),
-                (b"Cache-Control", b"no-cache"),
-                (b"Connection", b"keep-alive"),
-            ]
-        )
-    
-    async def stream_assistant_response(
-        self, 
-        assistant: GuardedAssistant, 
-        conversation: Conversation, 
-        x_bot_mode: str,
-        user_query: str
-    ) -> None:
-        """Stream the assistant response."""
-        try:
-            stream_generator = self._get_stream_generator(
-                assistant, conversation, x_bot_mode, user_query
+        for doc_data in doc_list:
+            processed_doc = ProcessedDocument(
+                file=doc_data["File"],
+                nota_number=doc_data.get("NotaNumber"),
+                source=source,
+                language=lang,
             )
-            
-            async for output in stream_generator:
-                response_chunk = json.dumps(output.model_dump()).encode("utf-8") + b"\n"
-                await self.consumer.send_body(response_chunk, more_body=True)
-            
-            await self.consumer.send_body(b"", more_body=False)
-            
-        except Exception as e:
-            logging.error(f"Error streaming response: {str(e)}")
-            raise
-    
-    def _get_stream_generator(
-        self, 
-        assistant: GuardedAssistant, 
-        conversation: Conversation, 
-        x_bot_mode: str,
-        user_query: str
+
+            was_uploaded, file_content = self.doc_processor.process_document(
+                doc=processed_doc, parsed_args=project_args
+            )
+
+            if was_uploaded:
+                processed_doc.content = file_content
+                newly_uploaded.append(processed_doc)
+
+        return newly_uploaded
+
+--------------------
+
+
+class DocumentProcessor:
+    """Processes SharePoint documents."""
+
+    def __init__(  # noqa: D107
+        self, api_client: SharePointAPIClient, cos_api: CosBucketApi, metadata_manager: MetadataManager
     ):
-        """Get the appropriate stream generator based on bot mode."""
-        if x_bot_mode == XBotMode.no_guardrails or should_avoid_guardrails(user_query):
-            return assistant.underlying_assistant.next_message_stream(
-                conversation, user_id="user_id"
-            )
-        elif x_bot_mode == XBotMode.default:
-            return assistant.next_message_stream(conversation, user_id="user_id")
-        else:
-            raise ValueError(f"Invalid X Bot Mode: {x_bot_mode}")
+        self.api_client = api_client
+        self.cos_api = cos_api
+        self.metadata_manager = metadata_manager
+        self.path_manager = PathManager()
 
-
-# Initialize the application
-app_initializer = AppInitializer()
-app_initializer.initialize()
-
-
-class HelloWorld(AsyncHttpConsumer):
-    """Index Page to ping the app."""
-
-    async def handle(self, body: bytes) -> None:
-        """Handle GET Request."""
-        message = "Hello World"
-        await self.send_response(
-            200,
-            message.encode("utf-8"),
-            headers=[(b"Content-Type", b"text/plain")]
+    def process_document(self, doc: ProcessedDocument, parsed_args) -> tuple[bool, bytes]:
+        """Process a single document. Returns True if document was uploaded/updated."""
+        file_info = doc.file
+        file_name, last_modified, source, language = (
+            file_info["Name"],
+            file_info["TimeLastModified"],
+            doc.source,
+            doc.language,
         )
 
+        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
 
-class RagAnswerConsumer(AsyncHttpConsumer):
-    """
-    An asynchronous HTTP consumer for handling RAG (Retrieval-Augmented Generation) answers.
-    
-    This consumer processes RAG requests, validates input, selects appropriate assistants
-    based on language, and streams responses back to the client.
-    """
+        if not DocumentFilter.is_parseable(file_name):
+            self._log_unparseable_document(file_name, doc, parsed_args)
+            return False, None
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.response_handler = ResponseHandler(self)
-        self.validator = RequestValidator()
+        if not DocumentFilter.is_recently_modified(last_modified):
+            if not self.cos_api.file_exists(file_path):
+                # File does not exist, upload it
+                file_content = self._upload_document_to_cos_and_save_metadata(doc, file_path)
+                return True, file_content
+            return False, None  # File exists and not recently modified
 
-    async def handle(self, body: bytes) -> None:
-        """
-        Handle incoming HTTP requests for RAG answers.
-        
-        Args:
-            body: The body of the incoming HTTP request.
-        """
+        # File was recently modified, upload it
+        file_content = self._upload_document_to_cos_and_save_metadata(doc, file_path)
+        return True, file_content
+
+    def delete_document(self, file_name: str) -> None:
+        """Delete document from COS and update metadata."""
+        metadata_path = self.path_manager.get_metadata_path()
+
+        deleted_doc_metadata = self.metadata_manager.get_metadata_by_filename(
+            file_name=file_name, metadata_path=metadata_path
+        )
+
+        if not deleted_doc_metadata:
+            # Nothing to delete
+            return
+
+        # Delete file from COS
+        source, language = deleted_doc_metadata["source"], deleted_doc_metadata["language"]
+        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
+        logger.info("Deleting file %s", file_name)
+        self.cos_api.delete_file(str(file_path))
+
+        # Remove from metadata
+        self.metadata_manager.remove_metadata(metadata_path=metadata_path, file_name=file_name)
+
+    def _upload_document_to_cos_and_save_metadata(self, doc: ProcessedDocument, document_path: str) -> bytes:
+        """Upload document to COS and save metadata."""
+        file_info = doc.file
+        file_name, server_relative_url = file_info["Name"], file_info["ServerRelativeUrl"]
+
+        logger.info("Downloading document %s from sharepoint...", file_name)
+
+        # Download file content
+        file_content = self.api_client.download_file(server_relative_url)
+
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+
         try:
-            # Validate request data
-            is_valid, validated_data, error_msg = self.validator.validate_request_data(body)
-            if not is_valid:
-                await self.response_handler.send_error_response(400, error_msg)
-                return
-            
-            # Validate headers
-            is_valid, headers_data, error_msg = self.validator.extract_and_validate_headers(
-                self.scope["headers"]
-            )
-            if not is_valid:
-                await self.response_handler.send_error_response(400, error_msg)
-                return
-            
-            # Process the request
-            await self._process_rag_request(validated_data, headers_data)
-            
-        except Exception as e:
-            logging.error(f"Unexpected error in RagAnswerConsumer: {str(e)}")
-            error_msg = json.dumps({"error": "Internal server error"})
-            await self.response_handler.send_error_response(500, error_msg)
+            logger.info("Uploading document %s to COS...", file_name)
+            # Upload to COS
+            self.cos_api.upload_file(temp_file_path, document_path)
 
-    async def _process_rag_request(self, validated_data: dict, headers_data: dict) -> None:
-        """
-        Process the RAG request and stream the response.
-        
-        Args:
-            validated_data: Validated request data
-            headers_data: Validated headers data
-        """
-        request_messages = validated_data["messages"]
-        language = headers_data["language"]
-        x_bot_mode = headers_data["x_bot_mode"]
-        
-        logging.debug("Mode: %s", x_bot_mode)
-        
-        # Select appropriate assistant
-        assistant = app_initializer.assistants[language]
-        
-        # Prepare conversation
-        messages = [
-            convert_to_RT_format(msg) 
-            for msg in request_messages 
-            if msg.get("role") != MessageRole.SYSTEM
-        ]
-        conversation = Conversation(messages=messages)
-        user_query = conversation.messages[-1].content
-        
-        # Send streaming headers
-        await self.response_handler.send_streaming_headers()
-        
-        # Stream the response
-        await self.response_handler.stream_assistant_response(
-            assistant, conversation, x_bot_mode, user_query
+            # Save metadata
+            metadata = DocumentMetadata(
+                file_name=file_name,
+                url=server_relative_url,
+                created_by=file_info.get("Author"),
+                last_modified=file_info["TimeLastModified"],
+                nota_number=doc.nota_number,
+                language=doc.language,
+                source=doc.source,
+            )
+
+            metadata_path = self.path_manager.get_metadata_path()
+            self.metadata_manager.write_metadata(metadata, metadata_path)
+
+            return file_content
+
+        finally:
+            # Clean up temporary file
+            os.unlink(temp_file_path)
+
+    def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument, p_args) -> None:
+        """Log unparseable document."""
+        DocumentParser.write_unparsed_docs(
+            unparsable_docs=[file_name],
+            source=doc.source,
+            language=doc.language,
+            project_name=p_args.project_name,
         )
+
+        _, extension = os.path.splitext(file_name)
+        logger.error("Files with extension '%s' are not supported", extension)
+		
+	
+	
+-------------
+
+class DocumentFilter:
+    """Handles document filtering logic."""
+
+    PARSEABLE_EXTENSIONS = {".doc", ".docx", ".pdf"}  # noqa: RUF012
+
+    @staticmethod
+    def is_parseable(file_name: str) -> bool:
+        """Check if document is parseable."""
+        _, extension = os.path.splitext(file_name)
+        return extension.lower() in DocumentFilter.PARSEABLE_EXTENSIONS
+		
+-----------
+
+##I want the ".doc" documents to be converted to docx format.
+
+##Here is the code that converts it.
+
+
+def convert_doc_to_docx_locally(filepath: str | Path, path_to_docx: str | Path) -> None:
+    """Converts a file or a folder of .doc to .docx format.
+
+    Args:
+        filepath: path to a single .doc or to a folder with one or several .doc (without *.doc)
+        path_to_docx: path to a folder where the .docx will be written
+    """
+    subprocess.run(["lowriter", "--convert-to", "docx", f"{filepath}", "--outdir", f"{path_to_docx}"], check=False)
+	
+	
+##Can you help?

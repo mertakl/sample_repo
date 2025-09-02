@@ -1,29 +1,7 @@
-In the following process;
-
-
-def _process_documents_for_source(self, lang: str, source: str, doc_list: list, project_args) -> list:
-        """Process documents for a specific source and return newly uploaded ones."""
-        newly_uploaded = []
-
-        for doc_data in doc_list:
-            processed_doc = ProcessedDocument(
-                file=doc_data["File"],
-                nota_number=doc_data.get("NotaNumber"),
-                source=source,
-                language=lang,
-            )
-
-            was_uploaded, file_content = self.doc_processor.process_document(
-                doc=processed_doc, parsed_args=project_args
-            )
-
-            if was_uploaded:
-                processed_doc.content = file_content
-                newly_uploaded.append(processed_doc)
-
-        return newly_uploaded
-
---------------------
+import os
+import tempfile
+import subprocess
+from pathlib import Path
 
 
 class DocumentProcessor:
@@ -47,7 +25,11 @@ class DocumentProcessor:
             doc.language,
         )
 
-        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
+        # For .doc files, we'll convert and store them as .docx
+        final_file_name = self._get_storage_filename(file_name)
+        file_path = self.path_manager.get_document_path(
+            source=source, language=language, file_name=final_file_name
+        )
 
         if not DocumentFilter.is_parseable(file_name):
             self._log_unparseable_document(file_name, doc, parsed_args)
@@ -78,7 +60,9 @@ class DocumentProcessor:
 
         # Delete file from COS
         source, language = deleted_doc_metadata["source"], deleted_doc_metadata["language"]
-        file_path = self.path_manager.get_document_path(source=source, language=language, file_name=file_name)
+        file_path = self.path_manager.get_document_path(
+            source=source, language=language, file_name=file_name
+        )
         logger.info("Deleting file %s", file_name)
         self.cos_api.delete_file(str(file_path))
 
@@ -89,25 +73,36 @@ class DocumentProcessor:
         """Upload document to COS and save metadata."""
         file_info = doc.file
         file_name, server_relative_url = file_info["Name"], file_info["ServerRelativeUrl"]
+        
+        # Convert .doc filename to .docx for everything
+        final_file_name = self._get_storage_filename(file_name)
 
         logger.info("Downloading document %s from sharepoint...", file_name)
 
         # Download file content
         file_content = self.api_client.download_file(server_relative_url)
 
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as temp_file:
+        # Create temporary file with original extension
+        original_extension = os.path.splitext(file_name)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=original_extension) as temp_file:
             temp_file.write(file_content)
-            temp_file_path = temp_file.name
+            original_temp_path = temp_file.name
 
         try:
-            logger.info("Uploading document %s to COS...", file_name)
-            # Upload to COS
-            self.cos_api.upload_file(temp_file_path, document_path)
+            # Handle .doc conversion
+            if original_extension.lower() == '.doc':
+                upload_file_path, final_file_content = self._convert_doc_to_docx(original_temp_path, file_name)
+            else:
+                upload_file_path = original_temp_path
+                final_file_content = file_content
 
-            # Save metadata
+            logger.info("Uploading document %s to COS...", final_file_name)
+            # Upload to COS
+            self.cos_api.upload_file(upload_file_path, document_path)
+
+            # Save metadata with converted filename
             metadata = DocumentMetadata(
-                file_name=file_name,
+                file_name=final_file_name,  # Converted filename
                 url=server_relative_url,
                 created_by=file_info.get("Author"),
                 last_modified=file_info["TimeLastModified"],
@@ -119,11 +114,63 @@ class DocumentProcessor:
             metadata_path = self.path_manager.get_metadata_path()
             self.metadata_manager.write_metadata(metadata, metadata_path)
 
-            return file_content
+            return final_file_content
 
         finally:
-            # Clean up temporary file
-            os.unlink(temp_file_path)
+            # Clean up temporary files
+            if os.path.exists(original_temp_path):
+                os.unlink(original_temp_path)
+            
+            # Clean up converted file if it's different from original
+            if original_extension.lower() == '.doc':
+                converted_path = self._get_converted_docx_path(original_temp_path)
+                if os.path.exists(converted_path):
+                    os.unlink(converted_path)
+
+    def _convert_doc_to_docx(self, doc_file_path: str, original_filename: str) -> tuple[str, bytes]:
+        """Convert .doc file to .docx and return path to converted file and its content."""
+        temp_dir = os.path.dirname(doc_file_path)
+        
+        # Convert .doc to .docx
+        self.convert_doc_to_docx_locally(doc_file_path, temp_dir)
+        
+        # Get the converted file path
+        converted_path = self._get_converted_docx_path(doc_file_path)
+        
+        if not os.path.exists(converted_path):
+            raise FileNotFoundError(f"Conversion failed: {converted_path} not found after conversion")
+        
+        # Read the converted file content
+        with open(converted_path, 'rb') as f:
+            converted_content = f.read()
+        
+        logger.info("Successfully converted %s to .docx format", original_filename)
+        return converted_path, converted_content
+
+    def _get_converted_docx_path(self, doc_path: str) -> str:
+        """Get the expected path of the converted .docx file."""
+        base_path = os.path.splitext(doc_path)[0]
+        return f"{base_path}.docx"
+
+    def _get_storage_filename(self, original_filename: str) -> str:
+        """Get the filename that will be used for storage (convert .doc to .docx)."""
+        name, extension = os.path.splitext(original_filename)
+        if extension.lower() == '.doc':
+            return f"{name}.docx"
+        return original_filename
+
+    @staticmethod
+    def convert_doc_to_docx_locally(filepath: str | Path, path_to_docx: str | Path) -> None:
+        """Converts a file or a folder of .doc to .docx format.
+
+        Args:
+            filepath: path to a single .doc or to a folder with one or several .doc (without *.doc)
+            path_to_docx: path to a folder where the .docx will be written
+        """
+        subprocess.run(
+            ["lowriter", "--convert-to", "docx", f"{filepath}", "--outdir", f"{path_to_docx}"], 
+            check=False
+        )
 
     def _log_unparseable_document(self, file_name: str, doc: ProcessedDocument, p_args) -> None:
         """Log unparseable document."""
@@ -136,37 +183,3 @@ class DocumentProcessor:
 
         _, extension = os.path.splitext(file_name)
         logger.error("Files with extension '%s' are not supported", extension)
-		
-	
-	
--------------
-
-class DocumentFilter:
-    """Handles document filtering logic."""
-
-    PARSEABLE_EXTENSIONS = {".doc", ".docx", ".pdf"}  # noqa: RUF012
-
-    @staticmethod
-    def is_parseable(file_name: str) -> bool:
-        """Check if document is parseable."""
-        _, extension = os.path.splitext(file_name)
-        return extension.lower() in DocumentFilter.PARSEABLE_EXTENSIONS
-		
------------
-
-##I want the ".doc" documents to be converted to docx format.
-
-##Here is the code that converts it.
-
-
-def convert_doc_to_docx_locally(filepath: str | Path, path_to_docx: str | Path) -> None:
-    """Converts a file or a folder of .doc to .docx format.
-
-    Args:
-        filepath: path to a single .doc or to a folder with one or several .doc (without *.doc)
-        path_to_docx: path to a folder where the .docx will be written
-    """
-    subprocess.run(["lowriter", "--convert-to", "docx", f"{filepath}", "--outdir", f"{path_to_docx}"], check=False)
-	
-	
-##Can you help?

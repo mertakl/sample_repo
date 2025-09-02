@@ -294,3 +294,14 @@ class VectorDBManager:
 Files are coming from sharepoint. I upload them to cos bucket and keep track of the files in a csv file. 
 I am not able to parse "doc" files in VectorDBManager. So I need to convert doc files to docx. Do you suggets to convert it at the beginning and use everywhere?
 In this case delet files won't work as the incoming files will be original. Can you help?
+
+##I need to use this method for conversion
+
+def convert_doc_to_docx_locally(filepath: str | Path, path_to_docx: str | Path) -> None:
+    """Converts a file or a folder of .doc to .docx format.
+
+    Args:
+        filepath: path to a single .doc or to a folder with one or several .doc (without *.doc)
+        path_to_docx: path to a folder where the .docx will be written
+    """
+    subprocess.run(["lowriter", "--convert-to", "docx", f"{filepath}", "--outdir", f"{path_to_docx}"], check=False)

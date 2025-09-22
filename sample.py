@@ -1,198 +1,526 @@
-  File "/mnt/code/bnppf_guardrails/utils.py", line 50, in next_message_stream
-    async for response in self.underlying_assistant.next_message_stream(conversation=conversation, **kwargs):
-  File "/mnt/code/bnppf_rag_engine/rag_engine/use_cases/samy_emp/assistant.py", line 135, in next_message_stream
-    async for response in self.generate_llm_answer_stream(conversation, user_id):
-  File "/mnt/code/bnppf_rag_engine/rag_engine/use_cases/samy_emp/assistant.py", line 244, in generate_llm_answer_stream
-    response=Message(role=MessageRole.ASSISTANT, content=content)
-  File "/opt/conda/envs/aisc-ap04/lib/python3.10/typing.py", line 957, in __call__
-    result = self.__origin__(*args, **kwargs)
-  File "/opt/conda/envs/aisc-ap04/lib/python3.10/typing.py", line 957, in __call__
-    result = self.__origin__(*args, **kwargs)
-  File "/opt/conda/envs/aisc-ap04/lib/python3.10/typing.py", line 387, in __call__
-    raise TypeError(f"Cannot instantiate {self!r}")
-TypeError: Cannot instantiate typing.Union
+import json
+import pytest
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from django.test import TestCase
+from channels.testing import HttpCommunicator
+from channels.db import database_sync_to_async
+import logging
 
-
-class DocumentChunk(BaseModel):
-    """A chunk of a document, indexed in a vector store or other database.
-
-    Its goal is to have all the metadata possible so that it is self-contained and no
-    downstream step needs to have access to the original document to do what they want with the chunk.
-
-    An important distinction is between the "key" and the "content" of a chunk:
-        - The content is the information that this chunk carries. It is, for example, the text
-        that will be shown to the LLM in a RAG pipeline.
-        - The key is the text used to retrieve this chunk from a database such as a vector store.
-        For example, the key might be a single sentence, but the content it refers to might be
-        the entire section which contains this sentence.
-
-    Attributes:
-        key: The text used to embed and retrieve this chunk.
-        content: The informational content carried by this chunk.
-        document_id: A unique id of the document this chunk is extracted from.
-        span_in_document: The span of this chunk within the Document, used to sort, concatenate and merge chunks.
-            This span should be **left-inclusive and right-exclusive**, e.g. the span of the string "el" in "hello"
-            is (1, 3)
-
-            When applicable, it should correspond to the character span of the chunk within the markdown representation of the document.
-            But some chunks might not correspond exactly to a string span within the Document, in which case it is the DocumentChunker's role
-            to output spans that are coherent and will give reasonable results when used downstream to sort, concatenate and merge
-            chunks.
-
-            See the "merge_chunks" function below for more details on how this span is used.
-        tables: A list of tables contained within this chunk, in the order in which they appear.
-        images: A list of images contained within this chunk, in the order in which they appear.
-        hyperlinks: A list of links contained within this chunk.
-        header_ancestry: A list of headers going from highest depth (top-level title) to lowest (current section's title)
-            e.g. ["Section 2: foo", "Sub-section 1: bar", "sub-sub-section 3: baz"].
-        headers_before: A list of the headers of the same level as the one containing this chunk, which
-            come before the one containing this chunk.
-        position_in_header_tree: A tuple of ints symbolizing this chunk's position in the tree of headers.
-            For example, if this chunk is in the first subsection of the third section, the tuple would be (2, 0).
-            Can be obtained from a Section object via the attribute of the same name.
-            If specified, allows you to use the reconstitute_document_structure function.
-        metadata: Any additional metadata necessary for downstream tasks.
-            An alternative to using this field is subclassing this class.
-    """
-
-    key: str
-    content: str
-    document_id: str
-    span_in_document: Span
-    tables: list[TableBlock] = Field(default_factory=list)
-    images: list[ImageBlock] = Field(default_factory=list)
-    hyperlinks: list[Hyperlink] = Field(default_factory=list)
-    header_ancestry: list[TitleBlock] = Field(default_factory=list)
-    headers_before: list[TitleBlock] = Field(default_factory=list)
-    position_in_header_tree: Optional[tuple[int, ...]] = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def check_span_length(self) -> Self:
-        """Verify that the length of the span_in_document is equal to the length of the chunk's content.
-        Note: this implicitly checks that the span is valid, i.e. the second element is greater than the first.
-        """
-        span_length = len(self.span_in_document)
-        if span_length != len(self.content):
-            raise ValueError(
-                f"The length implied by span_in_document ({span_length}) is different from the length of the content ({len(self.content)})."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def check_position_in_header_tree_is_coherent(self) -> Self:
-        """Verify that the position_in_header_tree attribute is coherent with the header_ancestry and
-        headers_before attributes.
-        """
-        # Nothing to check if the attribute is not present
-        if self.position_in_header_tree is None:
-            return self
-
-        if len(self.header_ancestry) != len(self.position_in_header_tree):
-            raise ValueError("`header_ancestry` and `position_in_header_tree` should be the same length.")
-
-        if self.position_in_header_tree and (len(self.headers_before) != self.position_in_header_tree[-1]):
-            raise ValueError(
-                "The last element of `position_in_header_tree` should be equal to the length of `headers_before`."
-            )
-
-        return self
-
-    def __lt__(self, other: "DocumentChunk") -> bool:
-        """We define the "<" operator so that chunks can be natively sorted using their position in the document.
-
-        Note that this comparison does not make sense if the chunks are not from the same document.
-        """
-        return self.span_in_document.tuple < other.span_in_document.tuple
-
-    @property
-    def previous_headers(self) -> list[TitleBlock]:
-        """Combine the header_ancestry with the headers_before to give the full sequence of headers
-        up to this chunk including the ones before it in the same section.
-        """
-        return self.header_ancestry[:-1] + self.headers_before + self.header_ancestry[-1:]
-
-    @property
-    def header_ancestry_localized(self) -> list[LocalizedHeader]:
-        """Same as header_ancestry, but returns LocalizedHeader objects instead of titles."""
-        if self.position_in_header_tree is None:
-            raise ValueError("To call this function, `position_in_header_tree` must not be None.")
-
-        return [
-            LocalizedHeader(header=header, position_in_header_tree=self.position_in_header_tree[: i + 1])
-            for i, header in enumerate(self.header_ancestry)
-        ]
-
-    @property
-    def headers_before_localized(self) -> list[LocalizedHeader]:
-        """Same as headers_before, but returns LocalizedHeader objects instead of titles."""
-        if self.position_in_header_tree is None:
-            raise ValueError("To call this function, `position_in_header_tree` must not be None.")
-
-        return [
-            LocalizedHeader(header=header, position_in_header_tree=(*self.position_in_header_tree[:-1], i))
-            for i, header in enumerate(self.headers_before)
-        ]
-
-    @property
-    def previous_headers_localized(self) -> list[LocalizedHeader]:
-        """Same as previous_headers, but returns LocalizedHeader objects instead of titles."""
-        if self.position_in_header_tree is None:
-            raise ValueError("To call this function, `position_in_header_tree` must not be None.")
-
-        return self.header_ancestry_localized[:-1] + self.headers_before_localized + self.header_ancestry_localized[-1:]
-
-
-class ConfidenceScore(BaseModel):
-    """Confidence score information.
-
-    Attributes:
-        does_context_contain_answer: True if the context contains information to completely answer the question
-        is_answer_correct_and_satisfying: True if business LLMJ finds the answer correct ans satisfying
-        contradicting_information_output: information about contradiction detection
-        confidence_grade: grade of the confidence score
-    """
-
-    does_context_contain_answer: bool | str  # str is temporary until we have context completness implemented
-    is_answer_correct_and_satisfying: bool
-    contradicting_information_output: ContradictionInformationOutput
-    confidence_grade: Literal["low", "medium", "high"]
-
-class Message(ConfiguredBaseModel):
-    """Message schema."""
-
-    role: MessageRole
-    content: str
-
-    def to_rag_toolbox(self) -> RTMessage:
-        """Helper: convert to RAG-Toolbox object."""
-        match self.role:
-            case MessageRole.SYSTEM:
-                return SystemMessage(content=self.content)
-            case MessageRole.ASSISTANT:
-                return AssistantMessage(content=self.content)
-            case MessageRole.USER:
-                return UserMessage(content=self.content)
-            case _:
-                raise NotImplementedError
-				
-class Metadata(ConfiguredBaseModel):
-    """Metadata Schema for yara samy response."""
-
-    confidence_score: ConfidenceScore | None
-    prompt: Prompt | None
-    keyword_search: bool
-    references: list[DocumentChunk] | None
-
-class YaraSamyResponse(ConfiguredBaseModel):
-    """Yara for Samy API Response Schema."""
-
-    response: Message | None = None
-    metadata: Metadata | None = None
-
-
-yield YaraSamyResponse(
-	response=Message(role=MessageRole.ASSISTANT, content=content)
-	
-Here is the content value = "Le coût du pack Easy Go est de 2€ par mois. Le premier paiement est effectué au début du mois suivant l’enregistrement. Il est important de noter que les options disponibles pour le pack Easy Go, telles que la carte de débit supplémentaire, la carte de crédit, les transactions manuelles illimitées et l'assurance compte, sont payantes et ont des coûts spécifiques :\n\n- Carte de débit supplémentaire : 1,20€ par carte et par mois\n- Carte de crédit : \n  - Visa Classic : 2,25€ par carte et par mois\n  - Mastercard Gold : 4,25€ par carte et par mois\n- Transactions manuelles illimitées : 5€ par mois\n- Assurance compte : 4,25€ par an\n\nCependant, il est mentionné que les options seront gratuites pour tous les clients jusqu'au 31/12/2024. Il est donc possible que le coût du pack Easy Go et de ses options soit temporairement réduit ou annulé pendant cette période. Il est recommandé de vérifier les conditions et les tarifs actuels pour obtenir des informations à jour.\nPour avoir plus d'information, je vous conseille de lire les références ci-dessous."
+# Import your consumers and related classes
+from consumers import (
+    ResponseHandler,
+    RequestValidator,
+    AppInitializer,
+    HelloWorld,
+    RagAnswerConsumer,
+    app_initializer
 )
+
+
+class TestResponseHandler(TestCase):
+    """Test cases for ResponseHandler class."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.mock_consumer = AsyncMock()
+        self.response_handler = ResponseHandler(self.mock_consumer)
+    
+    async def test_send_error_response(self):
+        """Test sending error response."""
+        status_code = 400
+        error_message = "Bad Request"
+        
+        await self.response_handler.send_error_response(status_code, error_message)
+        
+        self.mock_consumer.send_response.assert_called_once_with(
+            status_code,
+            error_message.encode("utf-8"),
+            headers={"Content-Type", "application/json"}
+        )
+    
+    async def test_send_streaming_headers(self):
+        """Test sending streaming headers."""
+        await self.response_handler.send_streaming_headers()
+        
+        expected_headers = [
+            ("Content-Type", "text/event-stream"),
+            ("Cache-Control", "no-cache"),
+            ("Connection", "keep-alive"),
+        ]
+        self.mock_consumer.send_headers.assert_called_once_with(expected_headers)
+    
+    @patch('consumers.json.dumps')
+    async def test_stream_assistant_response_success(self, mock_json_dumps):
+        """Test successful streaming of assistant response."""
+        # Mock dependencies
+        mock_assistant = Mock()
+        mock_conversation = Mock()
+        mock_output = Mock()
+        mock_output.model_dump.return_value = {"content": "test response"}
+        mock_json_dumps.return_value = '{"content": "test response"}'
+        
+        with patch.object(self.response_handler, '_get_stream_generator') as mock_get_generator:
+            mock_get_generator.return_value = [mock_output]
+            
+            await self.response_handler.stream_assistant_response(
+                mock_assistant, mock_conversation, "default", "test query"
+            )
+            
+            # Verify stream generator was called
+            mock_get_generator.assert_called_once_with(
+                mock_assistant, mock_conversation, "default", "test query"
+            )
+            
+            # Verify response was sent
+            self.mock_consumer.send_body.assert_any_call(
+                b'data: {"content": "test response"}\\n\\n',
+                more_body=True
+            )
+            self.mock_consumer.send_body.assert_called_with(b"", more_body=False)
+    
+    @patch('consumers.logging.error')
+    async def test_stream_assistant_response_exception(self, mock_log_error):
+        """Test exception handling in stream_assistant_response."""
+        mock_assistant = Mock()
+        mock_conversation = Mock()
+        
+        with patch.object(self.response_handler, '_get_stream_generator') as mock_get_generator:
+            mock_get_generator.side_effect = Exception("Test error")
+            
+            with pytest.raises(Exception, match="Test error"):
+                await self.response_handler.stream_assistant_response(
+                    mock_assistant, mock_conversation, "default", "test query"
+                )
+            
+            mock_log_error.assert_called_once()
+    
+    @patch('consumers.should_avoid_guardrails')
+    @patch('consumers.XBotMode')
+    def test_get_stream_generator_no_guardrails(self, mock_xbot_mode, mock_should_avoid):
+        """Test stream generator selection for no guardrails mode."""
+        mock_xbot_mode.no_guardrails = "no_guardrails"
+        mock_should_avoid.return_value = True
+        
+        mock_assistant = Mock()
+        mock_conversation = Mock()
+        
+        result = self.response_handler._get_stream_generator(
+            mock_assistant, mock_conversation, "no_guardrails", "test query"
+        )
+        
+        mock_assistant.next_message_stream.assert_called_once_with(
+            mock_conversation, user_id="user_id"
+        )
+    
+    @patch('consumers.should_avoid_guardrails')
+    @patch('consumers.XBotMode')
+    def test_get_stream_generator_default(self, mock_xbot_mode, mock_should_avoid):
+        """Test stream generator selection for default mode."""
+        mock_xbot_mode.default = "default"
+        mock_should_avoid.return_value = False
+        
+        mock_assistant = Mock()
+        mock_conversation = Mock()
+        
+        result = self.response_handler._get_stream_generator(
+            mock_assistant, mock_conversation, "default", "test query"
+        )
+        
+        mock_assistant.next_message_stream.assert_called_once_with(
+            mock_conversation, user_id="user_id"
+        )
+    
+    def test_get_stream_generator_invalid_mode(self):
+        """Test exception for invalid bot mode."""
+        mock_assistant = Mock()
+        mock_conversation = Mock()
+        
+        with pytest.raises(ValueError, match="Invalid X Bot Mode"):
+            self.response_handler._get_stream_generator(
+                mock_assistant, mock_conversation, "invalid_mode", "test query"
+            )
+
+
+class TestRequestValidator(TestCase):
+    """Test cases for RequestValidator class."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.validator = RequestValidator()
+    
+    @patch('consumers.RAGRequestSerializer')
+    def test_validate_request_data_success(self, mock_serializer_class):
+        """Test successful request data validation."""
+        mock_serializer = Mock()
+        mock_serializer.is_valid.return_value = True
+        mock_serializer.validated_data = {"messages": []}
+        mock_serializer_class.return_value = mock_serializer
+        
+        body = json.dumps({"messages": []}).encode("utf-8")
+        
+        is_valid, validated_data, error_msg = self.validator.validate_request_data(body)
+        
+        self.assertTrue(is_valid)
+        self.assertEqual(validated_data, {"messages": []})
+        self.assertIsNone(error_msg)
+    
+    @patch('consumers.RAGRequestSerializer')
+    def test_validate_request_data_invalid(self, mock_serializer_class):
+        """Test invalid request data validation."""
+        mock_serializer = Mock()
+        mock_serializer.is_valid.return_value = False
+        mock_serializer.errors = {"messages": ["This field is required."]}
+        mock_serializer_class.return_value = mock_serializer
+        
+        body = json.dumps({}).encode("utf-8")
+        
+        is_valid, validated_data, error_msg = self.validator.validate_request_data(body)
+        
+        self.assertFalse(is_valid)
+        self.assertIsNone(validated_data)
+        self.assertIn("error", json.loads(error_msg))
+    
+    def test_validate_request_data_json_decode_error(self):
+        """Test JSON decode error handling."""
+        body = b"invalid json"
+        
+        is_valid, validated_data, error_msg = self.validator.validate_request_data(body)
+        
+        self.assertFalse(is_valid)
+        self.assertIsNone(validated_data)
+        self.assertIn("Invalid JSON", json.loads(error_msg)["error"])
+    
+    @patch('consumers.AVAILABLE_LANGUAGES_TYPE')
+    @patch('consumers.XBotMode')
+    def test_extract_and_validate_headers_success(self, mock_xbot_mode, mock_available_languages):
+        """Test successful header validation."""
+        mock_available_languages.__args__ = ["en", "fr"]
+        mock_xbot_mode.default = "default"
+        
+        headers = [
+            (b"language", b"en"),
+            (b"x-bot-mode", b"default")
+        ]
+        
+        is_valid, headers_data, error_msg = self.validator.extract_and_validate_headers(headers)
+        
+        self.assertTrue(is_valid)
+        self.assertEqual(headers_data, {"language": "en", "x_bot_mode": "default"})
+        self.assertIsNone(error_msg)
+    
+    @patch('consumers.AVAILABLE_LANGUAGES_TYPE')
+    def test_extract_and_validate_headers_missing_language(self, mock_available_languages):
+        """Test header validation with missing language."""
+        mock_available_languages.__args__ = ["en", "fr"]
+        
+        headers = [(b"other-header", b"value")]
+        
+        is_valid, headers_data, error_msg = self.validator.extract_and_validate_headers(headers)
+        
+        self.assertFalse(is_valid)
+        self.assertIsNone(headers_data)
+        self.assertIn("Language is missing", json.loads(error_msg)["error"])
+    
+    @patch('consumers.AVAILABLE_LANGUAGES_TYPE')
+    def test_extract_and_validate_headers_unsupported_language(self, mock_available_languages):
+        """Test header validation with unsupported language."""
+        mock_available_languages.__args__ = ["en", "fr"]
+        
+        headers = [(b"language", b"es")]
+        
+        is_valid, headers_data, error_msg = self.validator.extract_and_validate_headers(headers)
+        
+        self.assertFalse(is_valid)
+        self.assertIsNone(headers_data)
+        self.assertIn("unsupported", json.loads(error_msg)["error"])
+
+
+class TestAppInitializer(TestCase):
+    """Test cases for AppInitializer class."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.app_initializer = AppInitializer()
+    
+    def test_init(self):
+        """Test AppInitializer initialization."""
+        self.assertIsNone(self.app_initializer.config_handler)
+        self.assertEqual(self.app_initializer.assistants, {})
+    
+    @patch('consumers.logging.basicConfig')
+    @patch.object(AppInitializer, '_load_cached_properties')
+    @patch.object(AppInitializer, '_initialize_assistants')
+    @patch.object(AppInitializer, '_setup_vector_db')
+    @patch.object(AppInitializer, '_setup_llm_connection')
+    @patch('consumers.get_or_raise_config')
+    def test_initialize(self, mock_get_config, mock_setup_llm, mock_setup_vector,
+                       mock_init_assistants, mock_load_cached, mock_basic_config):
+        """Test complete initialization process."""
+        mock_config_handler = Mock()
+        mock_get_config.return_value = mock_config_handler
+        
+        self.app_initializer.initialize()
+        
+        mock_basic_config.assert_called_once_with(level=logging.INFO)
+        mock_get_config.assert_called_once()
+        mock_setup_llm.assert_called_once()
+        mock_setup_vector.assert_called_once()
+        mock_init_assistants.assert_called_once()
+        mock_load_cached.assert_called_once()
+        self.assertEqual(self.app_initializer.config_handler, mock_config_handler)
+    
+    @patch('consumers.setup_llmhub_connection')
+    @patch('consumers.LLMHUB', "LLMHUB")
+    @patch('consumers.SAMY_EMP', "SAMY_EMP")
+    def test_setup_llm_connection_llmhub(self, mock_setup_llmhub):
+        """Test LLM connection setup for LLMHUB."""
+        mock_config_handler = Mock()
+        mock_config_handler.get_config.return_value = {"service": "LLMHUB"}
+        self.app_initializer.config_handler = mock_config_handler
+        
+        self.app_initializer._setup_llm_connection()
+        
+        mock_setup_llmhub.assert_called_once_with(project_name="SAMY_EMP")
+    
+    @patch('consumers.drop_and_resetup_vector_db')
+    def test_setup_vector_db_localhost(self, mock_drop_resetup):
+        """Test vector database setup for localhost."""
+        mock_config_handler = Mock()
+        vector_config = {"db_host": "localhost:5432"}
+        mock_config_handler.get_config.return_value = vector_config
+        self.app_initializer.config_handler = mock_config_handler
+        
+        self.app_initializer._setup_vector_db()
+        
+        mock_drop_resetup.assert_called_once_with(vector_config)
+    
+    @patch('consumers.get_guarded_yara_samy_assistant')
+    def test_initialize_assistants(self, mock_get_assistant):
+        """Test assistants initialization."""
+        mock_config_handler = Mock()
+        mock_config_handler.get_config.return_value = ["en", "fr"]
+        self.app_initializer.config_handler = mock_config_handler
+        
+        mock_assistant_en = Mock()
+        mock_assistant_fr = Mock()
+        mock_get_assistant.side_effect = [mock_assistant_en, mock_assistant_fr]
+        
+        self.app_initializer._initialize_assistants()
+        
+        self.assertEqual(len(self.app_initializer.assistants), 2)
+        self.assertEqual(self.app_initializer.assistants["en"], mock_assistant_en)
+        self.assertEqual(self.app_initializer.assistants["fr"], mock_assistant_fr)
+    
+    def test_load_cached_properties(self):
+        """Test loading cached properties for assistants."""
+        mock_assistant1 = Mock()
+        mock_assistant2 = Mock()
+        self.app_initializer.assistants = {"en": mock_assistant1, "fr": mock_assistant2}
+        
+        self.app_initializer._load_cached_properties()
+        
+        mock_assistant1.underlying_assistant.load_cached_properties.assert_called_once()
+        mock_assistant2.underlying_assistant.load_cached_properties.assert_called_once()
+
+
+class TestHelloWorld(TestCase):
+    """Test cases for HelloWorld consumer."""
+    
+    async def test_handle_request(self):
+        """Test HelloWorld handle method."""
+        consumer = HelloWorld()
+        consumer.send_response = AsyncMock()
+        
+        await consumer.handle(b"")
+        
+        consumer.send_response.assert_called_once_with(
+            200,
+            b"Hello World",
+            headers=[(b"Content-Type", b"text/plain")]
+        )
+
+
+class TestRagAnswerConsumer(TestCase):
+    """Test cases for RagAnswerConsumer."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.consumer = RagAnswerConsumer()
+        self.consumer.scope = {"headers": [(b"language", b"en"), (b"x-bot-mode", b"default")]}
+    
+    @patch('consumers.app_initializer')
+    async def test_handle_success(self, mock_app_init):
+        """Test successful request handling."""
+        # Mock dependencies
+        mock_assistant = Mock()
+        mock_app_init.assistants = {"en": mock_assistant}
+        
+        self.consumer.response_handler = AsyncMock()
+        self.consumer.validator = Mock()
+        
+        # Mock validation responses
+        self.consumer.validator.validate_request_data.return_value = (
+            True, {"messages": [{"role": "user", "content": "test"}]}, None
+        )
+        self.consumer.validator.extract_and_validate_headers.return_value = (
+            True, {"language": "en", "x_bot_mode": "default"}, None
+        )
+        
+        with patch.object(self.consumer, '_process_rag_request') as mock_process:
+            await self.consumer.handle(b'{"messages": []}')
+            
+            mock_process.assert_called_once()
+    
+    async def test_handle_invalid_request_data(self):
+        """Test handling invalid request data."""
+        self.consumer.response_handler = AsyncMock()
+        self.consumer.validator = Mock()
+        
+        self.consumer.validator.validate_request_data.return_value = (
+            False, None, "Invalid data"
+        )
+        
+        await self.consumer.handle(b'invalid json')
+        
+        self.consumer.response_handler.send_error_response.assert_called_once_with(
+            400, "Invalid data"
+        )
+    
+    async def test_handle_invalid_headers(self):
+        """Test handling invalid headers."""
+        self.consumer.response_handler = AsyncMock()
+        self.consumer.validator = Mock()
+        
+        self.consumer.validator.validate_request_data.return_value = (
+            True, {"messages": []}, None
+        )
+        self.consumer.validator.extract_and_validate_headers.return_value = (
+            False, None, "Invalid headers"
+        )
+        
+        await self.consumer.handle(b'{"messages": []}')
+        
+        self.consumer.response_handler.send_error_response.assert_called_once_with(
+            400, "Invalid headers"
+        )
+    
+    @patch('consumers.logging.error')
+    async def test_handle_unexpected_exception(self, mock_log_error):
+        """Test handling unexpected exceptions."""
+        self.consumer.response_handler = AsyncMock()
+        self.consumer.validator = Mock()
+        
+        self.consumer.validator.validate_request_data.side_effect = Exception("Unexpected error")
+        
+        await self.consumer.handle(b'{"messages": []}')
+        
+        mock_log_error.assert_called_once()
+        self.consumer.response_handler.send_error_response.assert_called_once_with(
+            500, json.dumps({"error": "Internal server error"})
+        )
+    
+    @patch('consumers.app_initializer')
+    @patch('consumers.Conversation')
+    @patch('consumers.convert_to_RT_format')
+    @patch('consumers.MessageRole')
+    async def test_process_rag_request(self, mock_message_role, mock_convert,
+                                     mock_conversation_class, mock_app_init):
+        """Test RAG request processing."""
+        # Setup mocks
+        mock_message_role.SYSTEM = "system"
+        mock_assistant = Mock()
+        mock_app_init.assistants = {"en": mock_assistant}
+        
+        mock_conversation = Mock()
+        mock_conversation.messages = [Mock(content="test query")]
+        mock_conversation_class.return_value = mock_conversation
+        
+        mock_convert.return_value = {"role": "user", "content": "test"}
+        
+        self.consumer.response_handler = AsyncMock()
+        
+        validated_data = {
+            "messages": [{"role": "user", "content": "test query"}]
+        }
+        headers_data = {
+            "language": "en",
+            "x_bot_mode": "default"
+        }
+        
+        await self.consumer._process_rag_request(validated_data, headers_data)
+        
+        # Verify streaming headers were sent
+        self.consumer.response_handler.send_streaming_headers.assert_called_once()
+        
+        # Verify response was streamed
+        self.consumer.response_handler.stream_assistant_response.assert_called_once_with(
+            mock_assistant, mock_conversation, "default", "test query"
+        )
+
+
+# Integration Tests
+class TestConsumersIntegration(TestCase):
+    """Integration tests for consumers."""
+    
+    def setUp(self):
+        """Set up integration test fixtures."""
+        self.mock_app_initializer = Mock()
+        self.mock_app_initializer.assistants = {"en": Mock(), "fr": Mock()}
+    
+    @patch('consumers.app_initializer')
+    async def test_full_rag_flow(self, mock_app_init):
+        """Test full RAG request flow integration."""
+        mock_app_init.assistants = {"en": Mock()}
+        
+        consumer = RagAnswerConsumer()
+        consumer.scope = {
+            "headers": [(b"language", b"en"), (b"x-bot-mode", b"default")]
+        }
+        
+        # Mock all external dependencies
+        with patch.object(consumer, 'response_handler') as mock_response_handler, \
+             patch.object(consumer, 'validator') as mock_validator, \
+             patch('consumers.Conversation'), \
+             patch('consumers.convert_to_RT_format'):
+            
+            mock_validator.validate_request_data.return_value = (
+                True, {"messages": [{"role": "user", "content": "test"}]}, None
+            )
+            mock_validator.extract_and_validate_headers.return_value = (
+                True, {"language": "en", "x_bot_mode": "default"}, None
+            )
+            
+            mock_response_handler.send_streaming_headers = AsyncMock()
+            mock_response_handler.stream_assistant_response = AsyncMock()
+            
+            request_body = json.dumps({
+                "messages": [{"role": "user", "content": "Hello, world!"}]
+            }).encode('utf-8')
+            
+            await consumer.handle(request_body)
+            
+            # Verify the full flow was executed
+            mock_response_handler.send_streaming_headers.assert_called_once()
+            mock_response_handler.stream_assistant_response.assert_called_once()
+
+
+# Test Configuration
+@pytest.fixture
+def mock_dependencies():
+    """Fixture to mock external dependencies."""
+    with patch('consumers.get_or_raise_config'), \
+         patch('consumers.setup_llmhub_connection'), \
+         patch('consumers.drop_and_resetup_vector_db'), \
+         patch('consumers.get_guarded_yara_samy_assistant'), \
+         patch('consumers.RAGRequestSerializer'), \
+         patch('consumers.AVAILABLE_LANGUAGES_TYPE'), \
+         patch('consumers.XBotMode'), \
+         patch('consumers.should_avoid_guardrails'), \
+         patch('consumers.Conversation'), \
+         patch('consumers.convert_to_RT_format'), \
+         patch('consumers.MessageRole'):
+        yield
+
+
+if __name__ == '__main__':
+    pytest.main([__file__])

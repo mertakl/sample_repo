@@ -1,326 +1,335 @@
-stages:
-  - test_and_quality    # Run tests first - no dependency on build
-  - build              # Build only when needed
-  - evaluation         # Depends on tests, not build
-  - sonar_and_release  # Parallelized final stages
+import logging
+import json
+import time
+from datetime import datetime
+from typing import Optional, Dict, Any
+import uuid
 
-# -----------------------
-# Build Stage
-# -----------------------
-build_image:
-  stage: build
-  allow_failure: true
-  variables:
-    DOCKER_IMAGE_NAME: "aisc-ap04"
-    PROJECT_DOCKER_SPACE: "np-3096-docker-local"
-    PROJECT_DOCKER_REGISTRY: "$PROJECT_DOCKER_SPACE.artifactory-dogen.group.echonet"
-    PROJECT_DOCKER_SPACE_3096: "p-3096-docker-local"
-    PROJECT_DOCKER_REGISTRY_3096: "$PROJECT_DOCKER_SPACE_3096.artifactory-dogen.group.echonet"
-    IMAGE_TAG: "$CI_COMMIT_SHA"
-    TEMPORARY_BRANCH_BUILD: "true"
-    DOCKER_BUILDKIT: 1  # Enable BuildKit for faster builds
-    BUILDKIT_PROGRESS: plain
-  image: $CI_REGISTRY/$CLOUDOTOOLS_IMAGE_TAG
-  tags:
-    - "ocp_xl"
-  rules:
-    # Only build on main branch, tags, or when specifically requested
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    - if: $CI_COMMIT_TAG
-      variables:
-        IMAGE_TAG: "$CI_COMMIT_TAG"
-        TEMPORARY_BRANCH_BUILD: "false"
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $BUILD_IMAGE == "true"
-      variables:
-        IMAGE_TAG: "$CI_COMMIT_SHA"
-        TEMPORARY_BRANCH_BUILD: "true"
-    - when: manual  # Allow manual trigger from MRs
-      allow_failure: true
-  before_script:
-    # Combine docker logins to reduce redundancy
-    - docker login $PROJECT_DOCKER_REGISTRY -u $ARTIFACTORY_USER -p $ARTIFACTORY_PASSWORD
-    - docker login $PROJECT_DOCKER_REGISTRY_3096 -u $ARTIFACTORY_3096_USER -p $ARTIFACTORY_3096_PASSWORD
-  script:
-    - echo "Using IMAGE_TAG=$IMAGE_TAG, temporary branch build = $TEMPORARY_BRANCH_BUILD"
-    # Use BuildKit with cache mounts and multi-stage optimization
-    - docker build . \
-        --network=host \
-        --label=bnpp.container.governance.image.auid="AP87605" \
-        --label .multiple --label here \
-        -t $PROJECT_DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:$IMAGE_TAG \
-        --cache-from $PROJECT_DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:latest \
-        --build-arg BUILDKIT_INLINE_CACHE=1 \
-        --build-arg ARTIFACTORY_USER=$ARTIFACTORY_3096_USER
-    - docker push $PROJECT_DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:$IMAGE_TAG
-  cache:
-    key: docker-$CI_COMMIT_REF_SLUG
-    paths:
-      - .docker/
-  retry:
-    max: 2
-    when: runner_system_failure
-  needs:
-    # Only build after tests pass (fast feedback)
-    - job: pytest
-      artifacts: false
-    - job: code_quality
-      artifacts: false
+class KibanaLogger:
+    """
+    Logger for sending structured logs to Kibana/Elasticsearch via LAAS (Kafka)
+    Assumes enable_laas_client() has already been called in Django settings
+    """
+    
+    def __init__(self, logger_name: str = "yara_eureka", log_level: str = "INFO"):
+        # Just get the logger - LAAS is already configured via Django settings
+        self.logger = logging.getLogger(logger_name)
+        
+        # Allow configuration of log level
+        level = getattr(logging, log_level.upper(), logging.INFO)
+        self.logger.setLevel(level)
+    
+    def _log_metric(self, event_type: str, data: Dict[str, Any]):
+        """Base method to log structured metrics"""
+        log_entry = {
+            "event_type": event_type,
+            **data
+        }
+        self.logger.info(json.dumps(log_entry))
+    
+    # ===== REQUEST METRICS =====
+    
+    def log_request(self, segment: str, amw_rights: str, conversation_id: str):
+        """Log each API request with segment and AMW rights"""
+        self._log_metric("api_request", {
+            "segment": segment,
+            "amw_rights": amw_rights,
+            "conversation_id": conversation_id
+        })
+    
+    def log_user_query(self, query: str, conversation_id: str, 
+                       conversation_length: int):
+        """Log user query details"""
+        self._log_metric("user_query", {
+            "conversation_id": conversation_id,
+            "query_size_chars": len(query),
+            "query_size_tokens": self._estimate_tokens(query),
+            "conversation_length": conversation_length
+        })
+    
+    # ===== TIMING METRICS =====
+    
+    def log_total_response_time(self, duration_ms: float, 
+                                conversation_id: str):
+        """Log total API response handling time"""
+        self._log_metric("response_time_total", {
+            "duration_ms": duration_ms,
+            "conversation_id": conversation_id
+        })
+    
+    def log_lexical_retrieval_time(self, duration_ms: float, 
+                                   conversation_id: str):
+        """Log lexical DB retrieval time"""
+        self._log_metric("retrieval_time_lexical", {
+            "duration_ms": duration_ms,
+            "conversation_id": conversation_id
+        })
+    
+    def log_semantic_retrieval_time(self, duration_ms: float, 
+                                    conversation_id: str):
+        """Log semantic DB retrieval time"""
+        self._log_metric("retrieval_time_semantic", {
+            "duration_ms": duration_ms,
+            "conversation_id": conversation_id
+        })
+    
+    def log_reranking_time(self, duration_ms: float, conversation_id: str,
+                          reranking_scores: Optional[list] = None):
+        """Log reranking API call time"""
+        data = {
+            "duration_ms": duration_ms,
+            "conversation_id": conversation_id
+        }
+        if reranking_scores:
+            data["reranking_scores"] = reranking_scores
+        self._log_metric("reranking_time", data)
+    
+    def log_llm_response_time(self, duration_ms: float, conversation_id: str,
+                             model_name: str):
+        """Log LLM API call time-to-response"""
+        self._log_metric("llm_response_time", {
+            "duration_ms": duration_ms,
+            "conversation_id": conversation_id,
+            "model_name": model_name
+        })
+    
+    def log_guardrails_latency(self, guardrail_type: str, duration_ms: float,
+                               conversation_id: str):
+        """Log input/output guardrails latency"""
+        self._log_metric("guardrails_latency", {
+            "guardrail_type": guardrail_type,  # "input" or "output"
+            "duration_ms": duration_ms,
+            "conversation_id": conversation_id
+        })
+    
+    # ===== MODEL API CALL COUNTS =====
+    
+    def log_embedding_call(self, call_type: str, model_name: str,
+                          conversation_id: str, num_items: int = 1):
+        """Log embedding model API calls (query or passage)"""
+        self._log_metric("embedding_api_call", {
+            "call_type": call_type,  # "query" or "passage"
+            "model_name": model_name,
+            "conversation_id": conversation_id,
+            "num_items": num_items
+        })
+    
+    def log_llm_call(self, model_name: str, conversation_id: str,
+                    prompt_size: Optional[int] = None):
+        """Log LLM model API calls"""
+        data = {
+            "model_name": model_name,
+            "conversation_id": conversation_id
+        }
+        if prompt_size:
+            data["prompt_size_tokens"] = prompt_size
+        self._log_metric("llm_api_call", data)
+    
+    def log_reranking_call(self, model_name: str, conversation_id: str,
+                          num_documents: int):
+        """Log reranking model API calls"""
+        self._log_metric("reranking_api_call", {
+            "model_name": model_name,
+            "conversation_id": conversation_id,
+            "num_documents": num_documents
+        })
+    
+    # ===== DOCUMENT & PARSING METRICS =====
+    
+    def log_document_parsing(self, source: str, document_name: str,
+                            status: str, error_message: Optional[str] = None):
+        """Log document parsing success/failure"""
+        data = {
+            "source": source,  # "KBM" or "Eureka"
+            "document_name": document_name,
+            "status": status,  # "success", "failed", "invalid_format"
+        }
+        if error_message:
+            data["error_message"] = error_message
+        self._log_metric("document_parsing", data)
+    
+    def log_caption_generation(self, status: str, document_name: str,
+                              error_message: Optional[str] = None):
+        """Log caption generation attempts"""
+        data = {
+            "document_name": document_name,
+            "status": status  # "success" or "failed"
+        }
+        if error_message:
+            data["error_message"] = error_message
+        self._log_metric("caption_generation", data)
+    
+    # ===== RESPONSE METRICS =====
+    
+    def log_response(self, response_type: str, response_size: int,
+                    conversation_id: str, confidence_grade: str,
+                    confidence_score: Optional[Dict] = None):
+        """Log response details"""
+        data = {
+            "response_type": response_type,
+            "response_size_chars": response_size,
+            "conversation_id": conversation_id,
+            "confidence_grade": confidence_grade  # "low", "medium", "high"
+        }
+        if confidence_score:
+            data["confidence_score"] = confidence_score
+        self._log_metric("response_details", data)
+    
+    def log_guardrail_trigger(self, trigger_type: str, conversation_id: str,
+                             message_type: str):
+        """Log guardrail triggers"""
+        self._log_metric("guardrail_trigger", {
+            "trigger_type": trigger_type,
+            "conversation_id": conversation_id,
+            "message_type": message_type  # "user" or "assistant"
+        })
+    
+    def log_eureka_interaction(self, interaction_type: str, 
+                              conversation_id: str):
+        """Log Eureka API interactions"""
+        self._log_metric("eureka_interaction", {
+            "interaction_type": interaction_type,
+            "conversation_id": conversation_id
+        })
+    
+    # ===== HELPER METHODS =====
+    
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimation (adjust based on your tokenizer)"""
+        return len(text.split())
+    
+    @staticmethod
+    def generate_conversation_id() -> str:
+        """Generate unique conversation ID"""
+        return str(uuid.uuid4())
 
-# -----------------------
-# Parallel Test & Quality Stage
-# -----------------------
-pytest:
-  stage: test_and_quality  # Now runs in parallel with other jobs
-  extends: .config_artifactory_template
-  image: $CI_REGISTRY/python:1.0.1
-  allow_failure: false
-  variables:
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  cache:
-    key: pip-$CI_COMMIT_REF_SLUG
-    paths:
-      - .cache/pip/
-      - .pytest_cache/
-  script:
-    # Template's before_script runs automatically, then our setup
-    - python -m pip install --upgrade pip
-    - python -m pip install -r requirements/requirements_domino_ci.txt
-    - python -m ci.scripts.call_tests_domino
-        --domino_url ${DOMINO_URL}
-        --domino_api_key ${DOMINO_API_KEY}
-        --domino_project_name ${DOMINO_PROJECT_NAME}
-        --domino_project_owner ${DOMINO_PROJECT_OWNER}
-        --git_commit_sha ${CI_COMMIT_SHA}
-        --domino_hardware_tier ${DOMINO_HARDWARE_TIER_TEST}
-        --domino_env_id ${DOMINO_ENV_ID}
-        --domino_revision_env ${DOMINO_REVISION_ENV}
-        --src_folders ${SRC_FOLDERS}
-        --coverage_min_pc ${COVERAGE_MIN_PC}
-  after_script:
-    - echo "See the test report at https://gitlab-dogen.group.echonet/dm/fortis/tribe_artificial_intelligence/aisc/aisc-ap04/-/pipelines/${CI_PIPELINE_ID}/test_report"
-  coverage: '/TOTAL.*\s+(\d+%)/'
-  artifacts:
-    reports:
-      coverage_report:
-        coverage_format: cobertura
-        path: coverage.xml
-      junit: report.xml
-    paths:
-      - coverage.xml
-      - report.xml
-      - report.html
-      - pylint-report.txt
-      - domino_metadata.json
-      - domino_support_bundle.zip
-    expire_in: 30 days
-  rules:
-    - if: $CI_COMMIT_AUTHOR =~ /semantic-release/
-      when: never
-    - when: on_success
-  retry:
-    max: 2
-    when: script_failure
 
-code_quality:
-  stage: test_and_quality  # Now runs in parallel with pytest
-  extends: .config_artifactory_template
-  allow_failure: true
-  variables:
-    PRE_COMMIT_HOME: "$CI_PROJECT_DIR/.cache/pre-commit"
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  cache:
-    key: code-quality-$CI_COMMIT_REF_SLUG
-    paths:
-      - .cache/pip/
-      - .cache/pre-commit/
-  script:
-    # Template's before_script runs automatically, then our setup
-    - git fetch origin --depth=50  # Limit fetch depth for speed
-    - python -m pip install --upgrade pip
-    - python -m pip install -r requirements/code_quality.txt
-    - pre-commit run --all-files
-  retry:
-    max: 2
-    when: script_failure
+# ===== USAGE EXAMPLE =====
 
-get_next_version:
-  stage: test_and_quality  # Now runs in parallel
-  extends: .config_artifactory_template
-  allow_failure: false
-  variables:
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  cache:
-    key: version-$CI_COMMIT_REF_SLUG
-    paths:
-      - .cache/pip/
-  script:
-    # Template's before_script runs automatically, then our setup
-    - python -m pip install --upgrade pip
-    - python -m pip install python-semantic-release==10.3.0
-    - '[[ -v CI_MERGE_REQUEST_TARGET_BRANCH_NAME ]] && FROM_REF="$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" || FROM_REF="$CI_DEFAULT_BRANCH"'
-    - git fetch origin $FROM_REF --depth=50
-    - git checkout $FROM_REF
-    - echo "The current branch is $FROM_REF"
-    - git pull
-    - VERSION=$(semantic-release --noop version --print)
-    - CURRENT_VERSION=$(grep -E "version *= *" pyproject.toml | sed -r 's/^version *= *"(.*)"/\1/')
-    - VERSION=${VERSION:-$CURRENT_VERSION}
-    - echo $VERSION | tee next_version
-  artifacts:
-    paths:
-      - next_version
-    expire_in: 30 days
-  rules:
-    - if: $CI_COMMIT_AUTHOR =~ /semantic-release/
-      when: never
-    - when: on_success
-  retry:
-    max: 2
-    when: script_failure
-
-# -----------------------
-# Evaluation Stage (depends on tests)
-# -----------------------
-retriever-eval:
-  stage: evaluation
-  extends: .config_artifactory_template
-  image: $CI_REGISTRY/python:1.0.1
-  allow_failure: true
-  variables:
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  cache:
-    key: eval-$CI_COMMIT_REF_SLUG
-    paths:
-      - .cache/pip/
-  script:
-    # Template's before_script runs automatically, then our setup
-    - python -m pip install --upgrade pip
-    - python -m pip install -r requirements/requirements_domino_ci.txt
-    - python -m ci.scripts.call_retriever_eval.domino
-        --domino_url ${DOMINO_URL}
-        --domino_api_key ${DOMINO_API_KEY}
-        --domino_project_name ${DOMINO_PROJECT_NAME}
-        --domino_project_owner ${DOMINO_PROJECT_OWNER}
-        --git_commit_sha ${CI_COMMIT_SHA}
-        --domino_hardware_tier ${DOMINO_HARDWARE_TIER_TEST}
-        --domino_env_id ${DOMINO_ENV_ID}
-        --domino_revision_env ${DOMINO_REVISION_ENV}
-        --experiment_name ${RETRIEVER_EVAL_EXPERIMENT}
-  after_script:
-    - echo "See the experiment results at https://dmn-ap26762-prod-c1bf2d58.datalab.cloud.echonet/experiments/fortis/aisc-ap04-ci"
-  rules:
-    - if: $CI_COMMIT_AUTHOR =~ /semantic-release/
-      when: never
-    - when: on_success
-  needs:
-    - job: pytest
-      artifacts: false  # Don't need artifacts, just job completion
-    - job: get_next_version
-      artifacts: true   # Need the version file
-
-# -----------------------
-# Parallel Final Stage
-# -----------------------
-update_sonar:
-  stage: sonar_and_release  # Now runs in parallel with release
-  allow_failure: true
-  image: $CI_REGISTRY/$SONAR_SCANNER_IMAGE_TAG
-  script:
-    - |
-      sonar-scanner \
-        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
-        -Dsonar.host.url=${SONAR_URL} \
-        -Dsonar.login=${SONAR_USER} \
-        -Dsonar.password=${SONAR_PASSWORD} \
-        -Dsonar.links.homepage=$CI_PROJECT_URL \
-        -Dsonar.projectVersion=$(cat next_version) \
-        -Dsonar.sources=$SRC_FOLDERS \
-        -Dsonar.tests=$SRC_TEST_FOLDERS \
-        -Dsonar.python.version=3 \
-        -Dsonar.python.xunit.reportPaths=report.xml \
-        -Dsonar.python.coverage.reportPaths=coverage.xml \
-        -Dsonar.python.pylint.reportPaths=pylint-report.txt \
-        -Dsonar.scm.disabled=False \
-        -Dsonar.scm.provider=git
-  rules:
-    - if: $CI_COMMIT_AUTHOR =~ /semantic-release/
-      when: never
-    - when: on_success
-  retry:
-    max: 2
-    when: script_failure
-  needs:
-    - job: pytest
-      artifacts: true   # Need test artifacts
-    - job: get_next_version
-      artifacts: true   # Need version file
-  tags:
-    - "ocp_l"
-
-release:
-  stage: sonar_and_release  # Now runs in parallel with sonar
-  extends: .config_artifactory_template
-  image: $CI_REGISTRY/python:1.0.1
-  variables:
-    EMAIL: "AAIPLATFORMSSUPPORT@bnpparibasfortis.com"
-    GIT_AUTHOR_NAME: "semantic release"
-    GIT_COMMITTER_NAME: "semantic release"
-    TWINE_PASSWORD: "$ARTIFACTORY_3096_PASSWORD"
-    TWINE_USERNAME: "$ARTIFACTORY_3096_USER"
-    TWINE_REPOSITORY_URL: "$ARTIFACTORY_URL/api/pypi/p-3096-pypi-RELEASE"
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  cache:
-    key: release-$CI_COMMIT_REF_SLUG
-    paths:
-      - .cache/pip/
-  script:
-    # Template's before_script runs automatically, then our setup
-    - python -m pip install --upgrade pip
-    - pip install python-semantic-release==10.3.0 twine build
-    - git fetch origin $CI_COMMIT_REF_NAME --depth=50
-    - git checkout $CI_COMMIT_REF_NAME
-    - echo "The current branch is $CI_COMMIT_REF_NAME"
-    - git pull
-    - git checkout -B "$CI_COMMIT_REF_NAME"
-    - git remote set-url origin "https://:${GITLAB_PASSWORD}@${CI_REPOSITORY_URL#*@}"
-    - semantic-release version
-    - |
-      if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
-        python -m twine upload dist/*
-      else
-        echo "No distribution files found or dist directory is empty"
-      fi
-  rules:
-    - if: $CI_COMMIT_AUTHOR =~ /semantic-release.*/
-      when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-  needs:
-    - job: get_next_version
-      artifacts: false  # Don't need artifacts for release
-
-# -----------------------
-# Global Configuration
-# -----------------------
-default:
-  interruptible: true  # Allow jobs to be interrupted by newer pipelines
-  
-workflow:
-  rules:
-    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
-      when: never  # Don't run on branch if MR exists
-    - when: always
-
-# -----------------------
-# Optional: Deployment Job (Example)
-# -----------------------
-# deploy_to_staging:
-#   stage: deploy
-#   script:
-#     - echo "Deploying image $PROJECT_DOCKER_REGISTRY/$DOCKER_IMAGE_NAME:$CI_COMMIT_SHA"
-#     # Your deployment logic here
-#   needs:
-#     - job: build_image
-#       artifacts: false
-#   rules:
-#     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-#   when: manual
+class YaraEurekaAPI:
+    """Example integration in your API"""
+    
+    def __init__(self):
+        # LAAS is already enabled in Django settings, just initialize logger
+        self.logger = KibanaLogger()
+    
+    def handle_request(self, user_query: str, segment: str, amw_rights: str,
+                      conversation_history: list):
+        conversation_id = self.logger.generate_conversation_id()
+        
+        # Log the request
+        self.logger.log_request(segment, amw_rights, conversation_id)
+        
+        # Log user query
+        self.logger.log_user_query(
+            user_query, 
+            conversation_id,
+            len(conversation_history)
+        )
+        
+        # Track total response time
+        start_time = time.time()
+        
+        # Input guardrails
+        guard_start = time.time()
+        self._check_input_guardrails(user_query)
+        self.logger.log_guardrails_latency(
+            "input",
+            (time.time() - guard_start) * 1000,
+            conversation_id
+        )
+        
+        # Lexical retrieval
+        lex_start = time.time()
+        lexical_results = self._lexical_search(user_query)
+        self.logger.log_lexical_retrieval_time(
+            (time.time() - lex_start) * 1000,
+            conversation_id
+        )
+        
+        # Semantic retrieval
+        sem_start = time.time()
+        # Log embedding call for query
+        self.logger.log_embedding_call(
+            "query", "text-embedding-model", conversation_id
+        )
+        semantic_results = self._semantic_search(user_query)
+        self.logger.log_semantic_retrieval_time(
+            (time.time() - sem_start) * 1000,
+            conversation_id
+        )
+        
+        # Reranking
+        rerank_start = time.time()
+        reranked_docs, scores = self._rerank_documents(
+            lexical_results + semantic_results
+        )
+        self.logger.log_reranking_call(
+            "reranker-model", conversation_id, len(reranked_docs)
+        )
+        self.logger.log_reranking_time(
+            (time.time() - rerank_start) * 1000,
+            conversation_id,
+            scores
+        )
+        
+        # LLM call
+        llm_start = time.time()
+        self.logger.log_llm_call(
+            "gpt-4", conversation_id, 
+            prompt_size=len(user_query.split())
+        )
+        response = self._generate_llm_response(user_query, reranked_docs)
+        self.logger.log_llm_response_time(
+            (time.time() - llm_start) * 1000,
+            conversation_id,
+            "gpt-4"
+        )
+        
+        # Output guardrails
+        guard_out_start = time.time()
+        self._check_output_guardrails(response)
+        self.logger.log_guardrails_latency(
+            "output",
+            (time.time() - guard_out_start) * 1000,
+            conversation_id
+        )
+        
+        # Log response details
+        self.logger.log_response(
+            response.response_type,
+            len(response.text),
+            conversation_id,
+            response.confidence_grade,
+            {
+                "contradictions": response.contradictions_score,
+                "judge_metric": response.judge_metric
+            }
+        )
+        
+        # Log total time
+        self.logger.log_total_response_time(
+            (time.time() - start_time) * 1000,
+            conversation_id
+        )
+        
+        return response
+    
+    def _check_input_guardrails(self, text):
+        pass  # Your implementation
+    
+    def _lexical_search(self, query):
+        pass  # Your implementation
+    
+    def _semantic_search(self, query):
+        pass  # Your implementation
+    
+    def _rerank_documents(self, docs):
+        pass  # Your implementation
+    
+    def _generate_llm_response(self, query, docs):
+        pass  # Your implementation
+    
+    def _check_output_guardrails(self, response):
+        pass  # Your implementation

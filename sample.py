@@ -1,335 +1,143 @@
-import logging
-import json
-import time
-from datetime import datetime
-from typing import Optional, Dict, Any
-import uuid
+-- 1. Add the ts_vector column
+ALTER TABLE my_documents
+ADD COLUMN tsv tsvector;
 
-class KibanaLogger:
+-- 2. Create a trigger to automatically update the tsv column
+-- (This keeps it in sync whenever a document is added or changed)
+CREATE OR REPLACE FUNCTION update_tsv_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.tsv := to_tsvector('english', NEW.document); -- Use your language
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tsvector_update_trigger
+BEFORE INSERT OR UPDATE ON my_documents
+FOR EACH ROW
+EXECUTE FUNCTION update_tsv_column();
+
+-- 3. Create a GIN index for fast searching
+CREATE INDEX tsv_gin_idx ON my_documents USING GIN(tsv);
+
+
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.documents import Document
+from langchain_postgres.vectorstores import PGVector
+from typing import List
+
+class TsVectorRetriever(BaseRetriever):
     """
-    Logger for sending structured logs to Kibana/Elasticsearch via LAAS (Kafka)
-    Assumes enable_laas_client() has already been called in Django settings
+    A simple retriever that wraps the PGVector.full_text_search() method.
     """
+    vectorstore: PGVector
+    """The PGVector store instance that contains the full_text_search method."""
     
-    def __init__(self, logger_name: str = "yara_eureka", log_level: str = "INFO"):
-        # Just get the logger - LAAS is already configured via Django settings
-        self.logger = logging.getLogger(logger_name)
+    search_type: str = "websearch"
+    """The tsquery search type to use (e.g., 'plain', 'phrase', 'websearch')."""
+
+    class Config:
+        """Allow arbitrary types for the vectorstore."""
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> List[Document]:
+        """
+        Implementation of the abstract method for retrieving relevant documents.
         
-        # Allow configuration of log level
-        level = getattr(logging, log_level.upper(), logging.INFO)
-        self.logger.setLevel(level)
-    
-    def _log_metric(self, event_type: str, data: Dict[str, Any]):
-        """Base method to log structured metrics"""
-        log_entry = {
-            "event_type": event_type,
-            **data
-        }
-        self.logger.info(json.dumps(log_entry))
-    
-    # ===== REQUEST METRICS =====
-    
-    def log_request(self, segment: str, amw_rights: str, conversation_id: str):
-        """Log each API request with segment and AMW rights"""
-        self._log_metric("api_request", {
-            "segment": segment,
-            "amw_rights": amw_rights,
-            "conversation_id": conversation_id
-        })
-    
-    def log_user_query(self, query: str, conversation_id: str, 
-                       conversation_length: int):
-        """Log user query details"""
-        self._log_metric("user_query", {
-            "conversation_id": conversation_id,
-            "query_size_chars": len(query),
-            "query_size_tokens": self._estimate_tokens(query),
-            "conversation_length": conversation_length
-        })
-    
-    # ===== TIMING METRICS =====
-    
-    def log_total_response_time(self, duration_ms: float, 
-                                conversation_id: str):
-        """Log total API response handling time"""
-        self._log_metric("response_time_total", {
-            "duration_ms": duration_ms,
-            "conversation_id": conversation_id
-        })
-    
-    def log_lexical_retrieval_time(self, duration_ms: float, 
-                                   conversation_id: str):
-        """Log lexical DB retrieval time"""
-        self._log_metric("retrieval_time_lexical", {
-            "duration_ms": duration_ms,
-            "conversation_id": conversation_id
-        })
-    
-    def log_semantic_retrieval_time(self, duration_ms: float, 
-                                    conversation_id: str):
-        """Log semantic DB retrieval time"""
-        self._log_metric("retrieval_time_semantic", {
-            "duration_ms": duration_ms,
-            "conversation_id": conversation_id
-        })
-    
-    def log_reranking_time(self, duration_ms: float, conversation_id: str,
-                          reranking_scores: Optional[list] = None):
-        """Log reranking API call time"""
-        data = {
-            "duration_ms": duration_ms,
-            "conversation_id": conversation_id
-        }
-        if reranking_scores:
-            data["reranking_scores"] = reranking_scores
-        self._log_metric("reranking_time", data)
-    
-    def log_llm_response_time(self, duration_ms: float, conversation_id: str,
-                             model_name: str):
-        """Log LLM API call time-to-response"""
-        self._log_metric("llm_response_time", {
-            "duration_ms": duration_ms,
-            "conversation_id": conversation_id,
-            "model_name": model_name
-        })
-    
-    def log_guardrails_latency(self, guardrail_type: str, duration_ms: float,
-                               conversation_id: str):
-        """Log input/output guardrails latency"""
-        self._log_metric("guardrails_latency", {
-            "guardrail_type": guardrail_type,  # "input" or "output"
-            "duration_ms": duration_ms,
-            "conversation_id": conversation_id
-        })
-    
-    # ===== MODEL API CALL COUNTS =====
-    
-    def log_embedding_call(self, call_type: str, model_name: str,
-                          conversation_id: str, num_items: int = 1):
-        """Log embedding model API calls (query or passage)"""
-        self._log_metric("embedding_api_call", {
-            "call_type": call_type,  # "query" or "passage"
-            "model_name": model_name,
-            "conversation_id": conversation_id,
-            "num_items": num_items
-        })
-    
-    def log_llm_call(self, model_name: str, conversation_id: str,
-                    prompt_size: Optional[int] = None):
-        """Log LLM model API calls"""
-        data = {
-            "model_name": model_name,
-            "conversation_id": conversation_id
-        }
-        if prompt_size:
-            data["prompt_size_tokens"] = prompt_size
-        self._log_metric("llm_api_call", data)
-    
-    def log_reranking_call(self, model_name: str, conversation_id: str,
-                          num_documents: int):
-        """Log reranking model API calls"""
-        self._log_metric("reranking_api_call", {
-            "model_name": model_name,
-            "conversation_id": conversation_id,
-            "num_documents": num_documents
-        })
-    
-    # ===== DOCUMENT & PARSING METRICS =====
-    
-    def log_document_parsing(self, source: str, document_name: str,
-                            status: str, error_message: Optional[str] = None):
-        """Log document parsing success/failure"""
-        data = {
-            "source": source,  # "KBM" or "Eureka"
-            "document_name": document_name,
-            "status": status,  # "success", "failed", "invalid_format"
-        }
-        if error_message:
-            data["error_message"] = error_message
-        self._log_metric("document_parsing", data)
-    
-    def log_caption_generation(self, status: str, document_name: str,
-                              error_message: Optional[str] = None):
-        """Log caption generation attempts"""
-        data = {
-            "document_name": document_name,
-            "status": status  # "success" or "failed"
-        }
-        if error_message:
-            data["error_message"] = error_message
-        self._log_metric("caption_generation", data)
-    
-    # ===== RESPONSE METRICS =====
-    
-    def log_response(self, response_type: str, response_size: int,
-                    conversation_id: str, confidence_grade: str,
-                    confidence_score: Optional[Dict] = None):
-        """Log response details"""
-        data = {
-            "response_type": response_type,
-            "response_size_chars": response_size,
-            "conversation_id": conversation_id,
-            "confidence_grade": confidence_grade  # "low", "medium", "high"
-        }
-        if confidence_score:
-            data["confidence_score"] = confidence_score
-        self._log_metric("response_details", data)
-    
-    def log_guardrail_trigger(self, trigger_type: str, conversation_id: str,
-                             message_type: str):
-        """Log guardrail triggers"""
-        self._log_metric("guardrail_trigger", {
-            "trigger_type": trigger_type,
-            "conversation_id": conversation_id,
-            "message_type": message_type  # "user" or "assistant"
-        })
-    
-    def log_eureka_interaction(self, interaction_type: str, 
-                              conversation_id: str):
-        """Log Eureka API interactions"""
-        self._log_metric("eureka_interaction", {
-            "interaction_type": interaction_type,
-            "conversation_id": conversation_id
-        })
-    
-    # ===== HELPER METHODS =====
-    
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """Rough token estimation (adjust based on your tokenizer)"""
-        return len(text.split())
-    
-    @staticmethod
-    def generate_conversation_id() -> str:
-        """Generate unique conversation ID"""
-        return str(uuid.uuid4())
+        Args:
+            query: The search query string.
+            
+        Returns:
+            A list of Document objects.
+        """
+        # Use the built-in full_text_search method from the PGVector store
+        # This method handles the tsquery conversion and ranking (ts_rank)
+        return self.vectorstore.full_text_search(
+            query=query, 
+            search_type=self.search_type
+)
+        import os
+from langchain_core.documents import Document
+from langchain_postgres.vectorstores import PGVector
+from langchain_openai import OpenAIEmbeddings # Or any other embedding model
+from langchain.retrievers import EnsembleRetriever
+
+# --- Assume this is your existing setup ---
+
+# 1. Database Connection
+CONNECTION_STRING = "postgresql+psycopg://user:password@localhost:5432/my_db"
+os.environ["POSTGRES_URL"] = CONNECTION_STRING
+
+# 2. Embedding Model
+embeddings = OpenAIEmbeddings()
+
+# 3. Example Documents
+docs = [
+    Document(page_content="The quick brown fox jumps over the lazy dog."),
+    Document(page_content="A journey of a thousand miles begins with a single step."),
+    Document(page_content="To be or not to be, that is the question."),
+    Document(page_content="LangChain provides tools for building applications with LLMs."),
+]
+
+# 4. Initialize and populate PGVector
+# This will create the table, embeddings, and (if you set it up) the tsv column.
+# Ensure you have run the SQL from Step 1 on the "langchain_pg_embedding" table
+# *after* this step, if the table is new.
+collection_name = "my_doc_collection"
+pgvector_store = PGVector.from_documents(
+    documents=docs,
+    embedding=embeddings,
+    collection_name=collection_name,
+    connection=CONNECTION_STRING,
+    # This pre-deletes the collection for a clean demo
+    pre_delete_collection=True, 
+)
+
+print("PGVector store populated.")
+# IMPORTANT: If this table was just created, you must now run the
+# SQL from Step 1 on the table (e.g., "langchain_pg_collection")
+# to add and index the 'tsv' column.
+
+# --- End of setup ---
 
 
-# ===== USAGE EXAMPLE =====
+# --- HERE IS THE SOLUTION ---
 
-class YaraEurekaAPI:
-    """Example integration in your API"""
-    
-    def __init__(self):
-        # LAAS is already enabled in Django settings, just initialize logger
-        self.logger = KibanaLogger()
-    
-    def handle_request(self, user_query: str, segment: str, amw_rights: str,
-                      conversation_history: list):
-        conversation_id = self.logger.generate_conversation_id()
-        
-        # Log the request
-        self.logger.log_request(segment, amw_rights, conversation_id)
-        
-        # Log user query
-        self.logger.log_user_query(
-            user_query, 
-            conversation_id,
-            len(conversation_history)
-        )
-        
-        # Track total response time
-        start_time = time.time()
-        
-        # Input guardrails
-        guard_start = time.time()
-        self._check_input_guardrails(user_query)
-        self.logger.log_guardrails_latency(
-            "input",
-            (time.time() - guard_start) * 1000,
-            conversation_id
-        )
-        
-        # Lexical retrieval
-        lex_start = time.time()
-        lexical_results = self._lexical_search(user_query)
-        self.logger.log_lexical_retrieval_time(
-            (time.time() - lex_start) * 1000,
-            conversation_id
-        )
-        
-        # Semantic retrieval
-        sem_start = time.time()
-        # Log embedding call for query
-        self.logger.log_embedding_call(
-            "query", "text-embedding-model", conversation_id
-        )
-        semantic_results = self._semantic_search(user_query)
-        self.logger.log_semantic_retrieval_time(
-            (time.time() - sem_start) * 1000,
-            conversation_id
-        )
-        
-        # Reranking
-        rerank_start = time.time()
-        reranked_docs, scores = self._rerank_documents(
-            lexical_results + semantic_results
-        )
-        self.logger.log_reranking_call(
-            "reranker-model", conversation_id, len(reranked_docs)
-        )
-        self.logger.log_reranking_time(
-            (time.time() - rerank_start) * 1000,
-            conversation_id,
-            scores
-        )
-        
-        # LLM call
-        llm_start = time.time()
-        self.logger.log_llm_call(
-            "gpt-4", conversation_id, 
-            prompt_size=len(user_query.split())
-        )
-        response = self._generate_llm_response(user_query, reranked_docs)
-        self.logger.log_llm_response_time(
-            (time.time() - llm_start) * 1000,
-            conversation_id,
-            "gpt-4"
-        )
-        
-        # Output guardrails
-        guard_out_start = time.time()
-        self._check_output_guardrails(response)
-        self.logger.log_guardrails_latency(
-            "output",
-            (time.time() - guard_out_start) * 1000,
-            conversation_id
-        )
-        
-        # Log response details
-        self.logger.log_response(
-            response.response_type,
-            len(response.text),
-            conversation_id,
-            response.confidence_grade,
-            {
-                "contradictions": response.contradictions_score,
-                "judge_metric": response.judge_metric
-            }
-        )
-        
-        # Log total time
-        self.logger.log_total_response_time(
-            (time.time() - start_time) * 1000,
-            conversation_id
-        )
-        
-        return response
-    
-    def _check_input_guardrails(self, text):
-        pass  # Your implementation
-    
-    def _lexical_search(self, query):
-        pass  # Your implementation
-    
-    def _semantic_search(self, query):
-        pass  # Your implementation
-    
-    def _rerank_documents(self, docs):
-        pass  # Your implementation
-    
-    def _generate_llm_response(self, query, docs):
-        pass  # Your implementation
-    
-    def _check_output_guardrails(self, response):
-        pass  # Your implementation
+# 5. Initialize the standard vector retriever
+vector_retriever = pgvector_store.as_retriever(search_kwargs={"k": 2})
+
+# 6. Initialize your new TsVectorRetriever
+# It re-uses the *same* vector store object and its connection
+ts_retriever = TsVectorRetriever(
+    vectorstore=pgvector_store,
+    search_type="websearch" # 'websearch' is good for natural language
+)
+
+# 7. Initialize the EnsembleRetriever
+# This combines and re-ranks the results (using Reciprocal Rank Fusion)
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[vector_retriever, ts_retriever],
+    weights=[0.5, 0.5]  # 50% vector, 50% keyword
+)
+
+# 8. Run your hybrid search!
+query = "building apps with langchain"
+
+print(f"\n--- Hybrid Search Results for: '{query}' ---")
+hybrid_results = ensemble_retriever.invoke(query)
+for doc in hybrid_results:
+    print(doc)
+
+# You can also test them individually
+print(f"\n--- Vector-Only Results ---")
+vector_results = vector_retriever.invoke(query)
+for doc in vector_results:
+    print(doc.page_content)
+
+print(f"\n--- Keyword-Only (ts_vector) Results ---")
+keyword_results = ts_retriever.invoke(query)
+for doc in keyword_results:
+    print(doc.page_content)

@@ -1,347 +1,376 @@
-from langchain_postgres import PGVector
-from langchain_postgres.vectorstores import PGVector
-from langchain_core.documents import Document
-from typing import List, Tuple
-import asyncpg
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+"""
+Refactored TsVectorSearchRetriever with improved structure and maintainability.
+"""
+from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass
+import logging
+import psycopg2
+from psycopg2.extensions import cursor as PsycopgCursor
+
+# Assuming these imports from your codebase
+from config_handler import ConfigHandler
+from chunk_database import ChunkDatabase
+from reranker import Reranker
+from models import Document, QueryResponse, SearchQuery
+
+logger = logging.getLogger(__name__)
+
+AVAILABLE_LANGUAGES_TYPE = str  # Replace with actual type
 
 
-class AsyncHybridSearchPgVector:
-    """
-    Async hybrid search combining PgVector semantic search with PostgreSQL ts_vector full-text search.
-    Results are combined and can be reranked.
-    """
-    
-    def __init__(
-        self,
-        async_connection_string: str,
-        embeddings,
-        collection_name: str = "langchain_documents",
-        k: int = 10
-    ):
-        """
-        Initialize hybrid search with PgVector and ts_vector in async mode.
-        
-        Args:
-            async_connection_string: Async PostgreSQL connection string (postgresql+asyncpg://...)
-            embeddings: LangChain embeddings instance
-            collection_name: Name of the vector store collection
-            k: Number of results to retrieve from each method
-        """
-        self.async_connection_string = async_connection_string
-        self.collection_name = collection_name
-        self.k = k
-        self.embeddings = embeddings
-        
-        # Create async engine
-        self.async_engine = create_async_engine(async_connection_string)
-        
-        # Initialize PgVector with async engine
-        self.vectorstore = PGVector(
-            embeddings=embeddings,
-            collection_name=collection_name,
-            async_mode=True,
-            engine=self.async_engine,
-            use_jsonb=True,
+@dataclass
+class RetrieverConfig:
+    """Configuration for the retriever."""
+    max_k: int
+    semantic_proportion_before_reranker: float
+    search_k_before_reranker: int
+
+
+@dataclass
+class VectorDBConfig:
+    """Configuration for vector database connection."""
+    username: str
+    password: str
+    host: str
+    port: int
+    database: str
+    schema: str
+
+    def get_connection_string(self) -> str:
+        """Build PostgreSQL connection string."""
+        return (
+            f"postgresql+psycopg://{self.username}:{self.password}@"
+            f"{self.host}:{self.port}/{self.database}"
+            f"?options=-csearch_path%3D{self.schema},ibm_extension"
         )
-        
-        # Extract connection params for asyncpg
-        self._parse_connection_params()
+
+
+class SQLQueries:
+    """SQL query templates for database operations."""
     
-    def _parse_connection_params(self):
-        """Parse connection string for asyncpg direct connections."""
-        # Extract from postgresql+asyncpg://user:pass@host:port/dbname
-        from urllib.parse import urlparse
-        parsed = urlparse(self.async_connection_string)
-        
-        self.db_params = {
-            'host': parsed.hostname,
-            'port': parsed.port or 5432,
-            'user': parsed.username,
-            'password': parsed.password,
-            'database': parsed.path.lstrip('/')
-        }
+    ALTER_TABLE_ADD_TSVECTOR = """
+        ALTER TABLE aisc_ap04.langchain_pg_embedding
+        ADD COLUMN IF NOT EXISTS document_tsvector tsvector;
+    """
     
-    async def setup_tsvector_column(self):
-        """Add ts_vector column and index to the collection if not exists."""
-        conn = await asyncpg.connect(**self.db_params)
+    CREATE_GIN_INDEX = """
+        CREATE INDEX IF NOT EXISTS idx_document_tsvector
+        ON aisc_ap04.langchain_pg_embedding
+        USING GIN(document_tsvector);
+    """
+    
+    CREATE_TSVECTOR_TRIGGER = """
+        CREATE OR REPLACE FUNCTION document_tsvector_trigger()
+        RETURNS trigger AS $$
+        BEGIN
+            NEW.document_tsvector := to_tsvector('{language}', COALESCE(NEW.document, ''));
+            RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql;
+    """
+    
+    DROP_TRIGGER = """
+        DROP TRIGGER IF EXISTS tsvector_update ON aisc_ap04.langchain_pg_embedding;
+    """
+    
+    CREATE_TRIGGER = """
+        CREATE TRIGGER tsvector_update
+        BEFORE INSERT OR UPDATE ON aisc_ap04.langchain_pg_embedding
+        FOR EACH ROW EXECUTE FUNCTION document_tsvector_trigger();
+    """
+    
+    TSVECTOR_SEARCH = """
+        SELECT
+            document,
+            cmetadata,
+            ts_rank(document_tsvector, websearch_to_tsquery('{language}', %s)) as score
+        FROM langchain_pg_embedding
+        WHERE document_tsvector @@ websearch_to_tsquery('{language}', %s)
+        ORDER BY score DESC
+        LIMIT %s;
+    """
+
+
+class DatabaseManager:
+    """Handles database connections and setup operations."""
+    
+    def __init__(self, config: VectorDBConfig, language: str):
+        self.config = config
+        self.language = language
+        self._connection = None
+    
+    def connect(self) -> psycopg2.extensions.connection:
+        """Establish database connection."""
+        if self._connection is None or self._connection.closed:
+            connection_str = self.config.get_connection_string()
+            # Remove the postgresql+psycopg prefix for psycopg2
+            connection_str = connection_str.replace("postgresql+psycopg://", "")
+            self._connection = psycopg2.connect(connection_str)
+        return self._connection
+    
+    def close(self):
+        """Close database connection."""
+        if self._connection and not self._connection.closed:
+            self._connection.close()
+    
+    def setup_tsvector_column(self) -> None:
+        """Setup tsvector column, index, and triggers."""
+        conn = self.connect()
+        cur = conn.cursor()
         
         try:
-            # Add tsvector column if not exists
-            await conn.execute("""
-                ALTER TABLE langchain_pg_embedding 
-                ADD COLUMN IF NOT EXISTS document_tsvector tsvector;
-            """)
+            # Add tsvector column
+            cur.execute(SQLQueries.ALTER_TABLE_ADD_TSVECTOR)
             
-            # Create GIN index for faster full-text search
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_document_tsvector 
-                ON langchain_pg_embedding 
-                USING GIN(document_tsvector);
-            """)
+            # Create GIN index
+            cur.execute(SQLQueries.CREATE_GIN_INDEX)
             
-            # Create trigger to automatically update tsvector on insert/update
-            await conn.execute("""
-                CREATE OR REPLACE FUNCTION document_tsvector_trigger() 
-                RETURNS trigger AS $$
-                BEGIN
-                    NEW.document_tsvector := to_tsvector('english', COALESCE(NEW.document, ''));
-                    RETURN NEW;
-                END
-                $$ LANGUAGE plpgsql;
-            """)
+            # Create trigger function
+            trigger_function = SQLQueries.CREATE_TSVECTOR_TRIGGER.format(
+                language=self.language
+            )
+            cur.execute(trigger_function)
             
-            await conn.execute("""
-                DROP TRIGGER IF EXISTS tsvector_update ON langchain_pg_embedding;
-            """)
+            # Drop existing trigger and create new one
+            cur.execute(SQLQueries.DROP_TRIGGER)
+            cur.execute(SQLQueries.CREATE_TRIGGER)
             
-            await conn.execute("""
-                CREATE TRIGGER tsvector_update 
-                BEFORE INSERT OR UPDATE ON langchain_pg_embedding
-                FOR EACH ROW EXECUTE FUNCTION document_tsvector_trigger();
-            """)
-            
-            # Update existing rows
-            await conn.execute("""
-                UPDATE langchain_pg_embedding
-                SET document_tsvector = to_tsvector('english', COALESCE(document, ''))
-                WHERE document_tsvector IS NULL;
-            """)
+            conn.commit()
+            logger.info("TsVector column setup completed successfully")
             
         except Exception as e:
-            print(f"Warning: Could not setup tsvector: {e}")
+            conn.rollback()
+            logger.warning(f"Could not setup tsvector: {e}")
+            raise
         finally:
-            await conn.close()
+            cur.close()
+
+
+class TsVectorSearcher:
+    """Handles full-text search operations using PostgreSQL tsvector."""
     
-    async def _tsvector_search(self, query: str, k: int = None) -> List[Tuple[Document, float]]:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+    
+    def search(
+        self, 
+        query: str, 
+        k: int = 10
+    ) -> List[Tuple[Document, float]]:
         """
-        Perform full-text search using PostgreSQL ts_vector.
+        Perform full-text search using tsvector.
         
         Args:
-            query: Search query
+            query: Search query string
             k: Number of results to return
             
         Returns:
             List of (Document, score) tuples
         """
-        if k is None:
-            k = self.k
-            
-        conn = await asyncpg.connect(**self.db_params)
+        conn = self.db_manager.connect()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         try:
             # Use ts_rank for scoring
-            results = await conn.fetch("""
-                SELECT 
-                    document,
-                    cmetadata,
-                    ts_rank(document_tsvector, websearch_to_tsquery('english', $1)) as rank
-                FROM langchain_pg_embedding
-                WHERE document_tsvector @@ websearch_to_tsquery('english', $1)
-                    AND collection_id = (SELECT uuid FROM langchain_pg_collection WHERE name = $2)
-                ORDER BY rank DESC
-                LIMIT $3;
-            """, query, self.collection_name, k)
+            sql_query = SQLQueries.TSVECTOR_SEARCH.format(
+                language=self.db_manager.language
+            )
+            cur.execute(sql_query, (query, query, k))
+            results = cur.fetchall()
             
             # Convert to Document objects with scores
             docs_with_scores = []
             for row in results:
                 doc = Document(
-                    page_content=row['document'],
-                    metadata=row['cmetadata'] or {}
+                    page_content=row["document"],
+                    metadata=row["cmetadata"] or {}
                 )
-                docs_with_scores.append((doc, float(row['rank'])))
+                score = float(row["score"]) if row["score"] else 0.0
+                docs_with_scores.append((doc, score))
             
             return docs_with_scores
             
+        except Exception as e:
+            logger.error(f"TsVector search failed: {e}")
+            return []
         finally:
-            await conn.close()
+            cur.close()
+
+
+class DocumentChunker:
+    """Handles document chunking operations."""
     
-    async def hybrid_search(
+    @staticmethod
+    def chunk_to_query_response(chunk: Document) -> QueryResponse:
+        """Convert a Document chunk to QueryResponse format."""
+        metadata = chunk.metadata or {}
+        
+        return QueryResponse(
+            chunk=chunk,
+            key=metadata.get("content", ""),
+            content=metadata.get("content", ""),
+            document_id=metadata.get("document_id", ""),
+            span_in_document=metadata.get("span_in_document"),
+            hyperlinks=metadata.get("hyperlinks", []),
+            tables=metadata.get("tables", []),
+            header_to_type={},  # Populate as needed
+            title=metadata.get("title", ""),
+            headers_before=metadata.get("headers_before", []),
+            metadata=metadata,
+            score=0.0,
+        )
+    
+    @classmethod
+    def documents_to_chunks(
+        cls, 
+        documents: List[Document]
+    ) -> List[QueryResponse]:
+        """Convert multiple documents to QueryResponse chunks."""
+        return [cls.chunk_to_query_response(doc) for doc in documents]
+
+
+class TsVectorSearchRetriever:
+    """
+    Hybrid search retriever combining semantic vector search with full-text search.
+    
+    Uses PostgreSQL's tsvector for full-text search and combines results with
+    semantic embeddings for improved retrieval quality.
+    """
+    
+    def __init__(
         self,
-        query: str,
-        k: int = None,
-        vector_weight: float = 0.5,
-        text_weight: float = 0.5
-    ) -> List[Tuple[Document, float]]:
+        config_handler: ConfigHandler,
+        database: ChunkDatabase,
+        reranker: Reranker,
+        language: AVAILABLE_LANGUAGES_TYPE,
+    ):
+        """Initialize the retriever with necessary components."""
+        self.config_handler = config_handler
+        self.database = database
+        self.reranker = reranker
+        self.language = language
+        
+        # Load configurations
+        self.retriever_config = self._load_retriever_config()
+        self.vectordb_config = self._load_vectordb_config()
+        
+        # Initialize components
+        self.db_manager = DatabaseManager(self.vectordb_config, language)
+        self.tsvector_searcher = TsVectorSearcher(self.db_manager)
+        
+        # Setup database
+        self._setup_database()
+    
+    def _load_retriever_config(self) -> RetrieverConfig:
+        """Load retriever configuration from config handler."""
+        retriever_config = self.config_handler.get_config("retriever")
+        max_k = int(retriever_config["k"])
+        
+        return RetrieverConfig(
+            max_k=max_k,
+            semantic_proportion_before_reranker=float(
+                retriever_config.get("semantic_proportion_before_reranker", 0.5)
+            ),
+            search_k_before_reranker=int(
+                retriever_config.get("search_k", max_k)
+            )
+        )
+    
+    def _load_vectordb_config(self) -> VectorDBConfig:
+        """Load vector database configuration."""
+        vectordb_config = self.config_handler.get_config("vector_db")
+        
+        return VectorDBConfig(
+            username=vectordb_config["db_user"],
+            password=vectordb_config["db_password"],
+            host=vectordb_config["db_host"],
+            port=int(vectordb_config["db_port"]),
+            database=vectordb_config["db_name"],
+            schema=vectordb_config["db_schema"]
+        )
+    
+    def _setup_database(self) -> None:
+        """Setup database with tsvector support."""
+        try:
+            self.db_manager.setup_tsvector_column()
+        except Exception as e:
+            logger.warning(f"Database setup failed: {e}")
+    
+    async def retrieve(
+        self, 
+        query: SearchQuery
+    ) -> List[QueryResponse]:
         """
-        Perform hybrid search combining vector and full-text search.
+        Retrieve documents using hybrid search approach.
+        
+        Combines semantic vector search with full-text search for better results.
         
         Args:
-            query: Search query
-            k: Number of final results to return
-            vector_weight: Weight for vector search scores (0-1)
-            text_weight: Weight for text search scores (0-1)
+            query: Search query with text and parameters
             
         Returns:
-            List of (Document, score) tuples sorted by combined score
+            List of ranked query responses
         """
-        if k is None:
-            k = self.k
-        
-        # Get results from both methods (retrieve more for better merging)
-        retrieval_k = k * 2
-        
-        # Vector search (async)
-        vector_results = await self.vectorstore.asimilarity_search_with_score(
-            query, k=retrieval_k
+        # Calculate how many results from each method
+        max_k_semantic = int(
+            self.retriever_config.search_k_before_reranker * 
+            self.retriever_config.semantic_proportion_before_reranker
         )
         
-        # Full-text search (async)
-        text_results = await self._tsvector_search(query, k=retrieval_k)
+        # Perform vector search
+        semantic_documents = await self._perform_semantic_search(
+            query.text, 
+            max_k_semantic
+        )
+        semantic_responses = DocumentChunker.documents_to_chunks(
+            semantic_documents
+        )
         
-        # Normalize scores and combine
-        combined = {}
+        # Perform full-text search
+        vector_results = self.tsvector_searcher.search(
+            query.text,
+            k=(self.retriever_config.search_k_before_reranker - max_k_semantic)
+        )
+        vector_responses = DocumentChunker.documents_to_chunks(
+            [doc for doc, _ in vector_results]
+        )
         
-        # Normalize vector scores (convert distance to similarity)
-        if vector_results:
-            max_vector_score = max(score for _, score in vector_results)
-            min_vector_score = min(score for _, score in vector_results)
-            score_range = max_vector_score - min_vector_score or 1
-            
-            for doc, score in vector_results:
-                # Convert distance to similarity (assuming L2 distance)
-                normalized_score = 1 - ((score - min_vector_score) / score_range)
-                doc_id = doc.page_content  # Use content as key
-                
-                if doc_id not in combined:
-                    combined[doc_id] = {'doc': doc, 'score': 0}
-                combined[doc_id]['score'] += normalized_score * vector_weight
+        # Combine results
+        combined_responses = semantic_responses + vector_responses
         
-        # Normalize text scores
-        if text_results:
-            max_text_score = max(score for _, score in text_results)
-            min_text_score = min(score for _, score in text_results)
-            score_range = max_text_score - min_text_score or 1
-            
-            for doc, score in text_results:
-                normalized_score = (score - min_text_score) / score_range if score_range > 0 else 1
-                doc_id = doc.page_content
-                
-                if doc_id not in combined:
-                    combined[doc_id] = {'doc': doc, 'score': 0}
-                combined[doc_id]['score'] += normalized_score * text_weight
-        
-        # Sort by combined score and return top k
-        sorted_results = sorted(
-            combined.values(),
-            key=lambda x: x['score'],
-            reverse=True
-        )[:k]
-        
-        return [(item['doc'], item['score']) for item in sorted_results]
-    
-    async def search_with_reranking(
-        self,
-        query: str,
-        reranker,
-        k: int = None,
-        initial_k: int = None
-    ) -> List[Document]:
-        """
-        Perform hybrid search followed by reranking.
-        
-        Args:
-            query: Search query
-            reranker: Reranker instance (e.g., from transformers or sentence-transformers)
-            k: Number of final results after reranking
-            initial_k: Number of results to retrieve before reranking
-            
-        Returns:
-            List of reranked Documents
-        """
-        if k is None:
-            k = self.k
-        if initial_k is None:
-            initial_k = k * 3  # Retrieve more docs for better reranking
-        
-        # Get hybrid search results
-        hybrid_results = await self.hybrid_search(query, k=initial_k)
-        docs = [doc for doc, _ in hybrid_results]
-        
-        # Rerank using BME or other reranker
-        if hasattr(reranker, 'rerank'):
-            reranked_docs = reranker.rerank(query, docs)[:k]
-        elif hasattr(reranker, 'arerank'):
-            # Support async rerankers
-            reranked_docs = await reranker.arerank(query, docs)
-            reranked_docs = reranked_docs[:k]
-        else:
-            # Fallback for different reranker APIs
-            reranked_docs = docs[:k]
+        # Rerank combined results
+        reranked_docs = await self._rerank_results(
+            query_responses=combined_responses,
+            query=query
+        )
         
         return reranked_docs
     
-    async def add_documents(self, documents: List[Document]) -> List[str]:
-        """
-        Add documents to the vectorstore.
-        
-        Args:
-            documents: List of documents to add
-            
-        Returns:
-            List of document IDs
-        """
-        return await self.vectorstore.aadd_documents(documents)
+    async def _perform_semantic_search(
+        self, 
+        query_text: str, 
+        k: int
+    ) -> List[Document]:
+        """Perform semantic vector search."""
+        return await self.database.vector_store.asimilarity_search_with_score(
+            query_text, 
+            k=k
+        )
     
-    async def close(self):
-        """Close the async engine."""
-        await self.async_engine.dispose()
-
-
-# Example usage
-async def main():
-    from langchain_openai import OpenAIEmbeddings
+    async def _rerank_results(
+        self,
+        query_responses: List[QueryResponse],
+        query: SearchQuery,
+        rerank_field: str = "key"
+    ) -> List[QueryResponse]:
+        """Rerank combined search results."""
+        return await self.reranker.rerank(
+            query_responses=query_responses,
+            query=query,
+            rerank_field=rerank_field
+        )
     
-    # Setup - note the postgresql+asyncpg:// prefix for async
-    async_connection_string = "postgresql+asyncpg://user:pass@localhost:5432/dbname"
-    embeddings = OpenAIEmbeddings()
-    
-    # Initialize hybrid search
-    hybrid_search = AsyncHybridSearchPgVector(
-        async_connection_string=async_connection_string,
-        embeddings=embeddings,
-        collection_name="my_documents",
-        k=10
-    )
-    
-    # Setup tsvector column and indexes
-    await hybrid_search.setup_tsvector_column()
-    
-    # Add documents (vectorstore handles embedding)
-    documents = [
-        Document(page_content="Your document content here", metadata={"source": "doc1"}),
-        Document(page_content="Another document with different content", metadata={"source": "doc2"}),
-        # ... more documents
-    ]
-    await hybrid_search.add_documents(documents)
-    
-    # Perform hybrid search
-    results = await hybrid_search.hybrid_search(
-        query="your search query",
-        k=5,
-        vector_weight=0.5,
-        text_weight=0.5
-    )
-    
-    print("Hybrid search results:")
-    for doc, score in results:
-        print(f"Score: {score:.4f} - {doc.page_content[:100]}...")
-    
-    # With reranking (example with hypothetical reranker)
-    # from some_reranker_library import BMEReranker
-    # reranker = BMEReranker()
-    # reranked_results = await hybrid_search.search_with_reranking(
-    #     query="your search query",
-    #     reranker=reranker,
-    #     k=5,
-    #     initial_k=20
-    # )
-    
-    # Clean up
-    await hybrid_search.close()
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    def __del__(self):
+        """Cleanup database connections."""
+        if hasattr(self, 'db_manager'):
+            self.db_manager.close()

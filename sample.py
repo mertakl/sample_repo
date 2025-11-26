@@ -11,7 +11,7 @@ from psycopg2.extensions import cursor as PsycopgCursor
 from config_handler import ConfigHandler
 from chunk_database import ChunkDatabase
 from reranker import Reranker
-from models import Document, QueryResponse, SearchQuery
+from models import Document, QueryResponse, SearchQuery, DocumentChunk
 
 logger = logging.getLogger(__name__)
 
@@ -201,32 +201,63 @@ class DocumentChunker:
     """Handles document chunking operations."""
     
     @staticmethod
-    def chunk_to_query_response(chunk: Document) -> QueryResponse:
-        """Convert a Document chunk to QueryResponse format."""
-        metadata = chunk.metadata or {}
+    def document_to_chunk(document: Document) -> DocumentChunk:
+        """Convert a Document to DocumentChunk format."""
+        metadata = document.metadata or {}
         
-        return QueryResponse(
-            chunk=chunk,
-            key=metadata.get("content", ""),
-            content=metadata.get("content", ""),
+        return DocumentChunk(
+            key=metadata.get("content", document.page_content),
+            content=metadata.get("content", document.page_content),
             document_id=metadata.get("document_id", ""),
             span_in_document=metadata.get("span_in_document"),
             hyperlinks=metadata.get("hyperlinks", []),
             tables=metadata.get("tables", []),
-            header_to_type={},  # Populate as needed
+            header_to_type=metadata.get("header_to_type", {}),
             title=metadata.get("title", ""),
             headers_before=metadata.get("headers_before", []),
-            metadata=metadata,
-            score=0.0,
         )
     
     @classmethod
-    def documents_to_chunks(
+    def create_query_response(
+        cls,
+        document: Document,
+        score: Optional[float] = None
+    ) -> QueryResponse:
+        """Create a QueryResponse from a Document."""
+        chunk = cls.document_to_chunk(document)
+        metadata = document.metadata or {}
+        
+        return QueryResponse(
+            chunk=chunk,
+            score=score,
+            metadata=metadata
+        )
+    
+    @classmethod
+    def documents_to_query_responses(
         cls, 
-        documents: List[Document]
+        documents: List[Document],
+        scores: Optional[List[float]] = None
     ) -> List[QueryResponse]:
-        """Convert multiple documents to QueryResponse chunks."""
-        return [cls.chunk_to_query_response(doc) for doc in documents]
+        """Convert multiple documents to QueryResponse objects."""
+        if scores is None:
+            scores = [None] * len(documents)
+        
+        return [
+            cls.create_query_response(doc, score) 
+            for doc, score in zip(documents, scores)
+        ]
+    
+    @classmethod
+    def documents_with_scores_to_query_responses(
+        cls,
+        docs_with_scores: List[Tuple[Document, float]]
+    ) -> List[QueryResponse]:
+        """Convert documents with scores to QueryResponse objects."""
+        return [
+            cls.create_query_response(doc, score)
+            for doc, score in docs_with_scores
+        ]
 
 
 class TsVectorSearchRetriever:
@@ -323,7 +354,7 @@ class TsVectorSearchRetriever:
                 query.text, 
                 max_k_semantic
             )
-            semantic_responses = DocumentChunker.documents_to_chunks(
+            semantic_responses = DocumentChunker.documents_to_query_responses(
                 semantic_documents
             )
         except Exception as e:
@@ -336,8 +367,8 @@ class TsVectorSearchRetriever:
                 query.text,
                 k=(self.retriever_config.search_k_before_reranker - max_k_semantic)
             )
-            vector_responses = DocumentChunker.documents_to_chunks(
-                [doc for doc, _ in vector_results]
+            vector_responses = DocumentChunker.documents_with_scores_to_query_responses(
+                vector_results
             )
         except Exception as e:
             logger.error("TsVector search failed: %s", e)

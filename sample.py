@@ -138,9 +138,9 @@ class DatabaseManager:
             conn.commit()
             logger.info("TsVector column setup completed successfully")
             
-        except Exception as e:
+        except psycopg2.Error as e:
             conn.rollback()
-            logger.warning(f"Could not setup tsvector: {e}")
+            logger.warning("Could not setup tsvector: %s", e)
             raise
         finally:
             cur.close()
@@ -190,8 +190,8 @@ class TsVectorSearcher:
             
             return docs_with_scores
             
-        except Exception as e:
-            logger.error(f"TsVector search failed: {e}")
+        except psycopg2.Error as e:
+            logger.error("TsVector search failed: %s", e)
             return []
         finally:
             cur.close()
@@ -293,8 +293,8 @@ class TsVectorSearchRetriever:
         """Setup database with tsvector support."""
         try:
             self.db_manager.setup_tsvector_column()
-        except Exception as e:
-            logger.warning(f"Database setup failed: {e}")
+        except psycopg2.Error as e:
+            logger.warning("Database setup failed: %s", e)
     
     async def retrieve(
         self, 

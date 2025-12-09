@@ -1,19 +1,9 @@
-import pytest
+# project1/conftest.py
+import os
+import django
+from django.conf import settings
 
-@pytest.fixture(autouse=True, scope="session")
-def set_django_settings():
-    import os
-    os.environ["DJANGO_SETTINGS_MODULE"] = "project_a.settings"
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'project1.settings')
 
-
-[pytest]
-DJANGO_SETTINGS_MODULE =
-testpaths =
-    project_a/tests
-    project_b/tests
-
-markers =
-    project_a: Tests for Project A (uses project A settings)
-    project_b: Tests for Project B (uses project B settings)
-
-
+if not settings.configured:
+    django.setup()

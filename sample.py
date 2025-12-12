@@ -1,4 +1,3 @@
-
 """
 SSE streaming endpoint for LLM Assistant Backend.
 
@@ -138,7 +137,7 @@ async def sse_event_generator(
                 if hasattr(message, "model_dump")
                 else message
             )
-            action = self._extract_action(message_dict, message)
+            action = _extract_action(message_dict, message)
 
             logger.debug(
                 "SSE event #%d - action=%s, discussion_id=%s",

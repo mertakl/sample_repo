@@ -1,115 +1,128 @@
 def update_publication_document_from_moniteur_belge(
-    self, 
-    publication: LegalEntityPublication, 
-    cancellation_event: Event | None = None
+    self,
+    publication: LegalEntityPublication,
+    cancellation_event: Event | None = None,
 ) -> UpdatePublicationResult:
     """
-    Update publication document from Moniteur Belge.
+    Updates or creates a publication document from Moniteur Belge.
     
-    Returns appropriate UpdatePublicationResult based on the operation outcome.
+    Handles four cases:
+    1. New publication - create and download
+    2. Identical existing publication - skip
+    3. Existing without document - update and download
+    4. Existing with different metadata - update metadata only
     """
-    # Handle cancellation
-    if cancellation_event and cancellation_event.is_set():
-        logger.debug(
-            "Cancelled update_publication_document_from_moniteur_belge for publication with "
-            "VAT: %s, NUMBER: %s, DATE: %s",
+    
+    def log_pub(msg: str, level: str = "debug") -> None:
+        """Helper to log publication-specific messages."""
+        getattr(logger, level)(
+            msg,
             publication.legal_entity_vat,
             publication.publication_number,
             publication.publication_date,
+        )
+    
+    # Early exit conditions
+    if cancellation_event and cancellation_event.is_set():
+        log_pub(
+            "Cancelled update for publication VAT: %s, NUMBER: %s, DATE: %s"
         )
         return UpdatePublicationResult.CANCELLED
     
+    if publication.publication_document_id is None:
+        return UpdatePublicationResult.IGNORED
+    
     try:
-        logger.debug(
-            "Searching for publication %s, %s, %s",
-            publication.legal_entity_vat,
-            publication.publication_number,
-            publication.publication_date,
-        )
+        log_pub("Searching for publication %s, %s, %s")
         
-        # Check if document already exists
-        if publication.publication_document_id is None:
-            result = self._handle_new_publication(publication)
-        else:
-            result = self._handle_existing_publication(publication)
-            
-        return result
+        existing = self._get_existing_publication(publication)
         
+        if existing is None:
+            return self._handle_new_publication(publication, log_pub)
+        
+        if self._publications_are_identical(existing, publication):
+            log_pub("Publication VAT: %s, DATE: %s already exists")
+            return UpdatePublicationResult.OK_NO_NEED_TO_UPDATE
+        
+        if not existing.publication_document_id:
+            return self._handle_missing_document(publication, log_pub)
+        
+        return self._handle_metadata_update(publication, log_pub)
+    
     except Exception as e:
         logger.error(
-            "Error saving publication with VAT: %s and DATE: %s. Stack Trace: %s",
+            "Error saving publication VAT: %s, DATE: %s. Error: %s",
             publication.legal_entity_vat,
             publication.publication_date,
             str(e),
             exc_info=True,
         )
-        traceback.print_exc()
         return UpdatePublicationResult.ERROR_OTHER
-        
+    
     finally:
         connection.close()
-
-
-def _handle_new_publication(self, publication: LegalEntityPublication) -> UpdatePublicationResult:
-    """Handle publication that doesn't exist in DB yet."""
-    existing_publication = LegalEntityPublication.objects.filter(
-        legal_entity_vat=publication.legal_entity_vat,
-        publication_number=publication.publication_number,
-        publication_date=publication.publication_date,
-    ).first()
     
-    if not existing_publication:
-        logger.debug(
-            "Publication with VAT: %s, NUMBER: %s, DATE: %s does not exists yet. "
-            "Inserting the entry in the DB and downloading the document...",
-            publication.legal_entity_vat,
-            publication.publication_number,
-            publication.publication_date,
+    # Helper methods
+    
+    def _get_existing_publication(
+        self, publication: LegalEntityPublication
+    ) -> LegalEntityPublication | None:
+        """Retrieve existing publication matching the given criteria."""
+        return LegalEntityPublication.objects.filter(
+            legal_entity_vat=publication.legal_entity_vat,
+            publication_number=publication.publication_number,
+            publication_date=publication.publication_date,
+        ).first()
+    
+    def _publications_are_identical(
+        self, existing: LegalEntityPublication, new: LegalEntityPublication
+    ) -> bool:
+        """Check if two publications are identical."""
+        return existing == new
+    
+    def _handle_new_publication(
+        self, publication: LegalEntityPublication, log_pub
+    ) -> UpdatePublicationResult:
+        """Handle creation of a new publication."""
+        log_pub(
+            "Publication VAT: %s, NUMBER: %s, DATE: %s does not exist. "
+            "Creating and downloading document..."
         )
         
-        successfully_saved_file = self._download_n_save_document(publication)
-        
-        if not successfully_saved_file:
+        if not self._download_n_save_document(publication):
             publication.publication_document_id = None
             return UpdatePublicationResult.ERROR_METADATA_CREATED_BUT_DOCUMENT_FAILED
         
         publication.save(force_insert=True)
         return UpdatePublicationResult.OK_CREATED_SUCCESSFULLY
     
-    # Publication exists but without document
-    logger.debug(
-        "Publication with VAT: %s and DATE: %s already exists",
-        publication.legal_entity_vat,
-        publication.publication_date,
-    )
-    return UpdatePublicationResult.OK_NO_NEED_TO_UPDATE
-
-
-def _handle_existing_publication(self, publication: LegalEntityPublication) -> UpdatePublicationResult:
-    """Handle publication that already has a document."""
-    logger.info(
-        "Publication with VAT: %s, NUMBER: %s, and DATE: %s already exists but without a document. "
-        "Updating Metadata and document",
-        publication.legal_entity_vat,
-        publication.publication_number,
-        publication.publication_date,
-    )
+    def _handle_missing_document(
+        self, publication: LegalEntityPublication, log_pub
+    ) -> UpdatePublicationResult:
+        """Handle publication that exists but has no document."""
+        log_pub(
+            "Publication VAT: %s, NUMBER: %s, DATE: %s exists but missing document. "
+            "Updating and downloading..."
+        )
+        logger.info(
+            "File %s was previously missing — retrying download",
+            publication.document_url,
+        )
+        
+        if not self._download_n_save_document(publication):
+            return UpdatePublicationResult.ERROR_UPDATE_DOCUMENT_FAILED
+        
+        publication.save(force_update=True)
+        return UpdatePublicationResult.OK_DOCUMENT_UPDATED_SUCCESSFULLY
     
-    successfully_saved_file = self._download_n_save_document(publication)
-    
-    if not successfully_saved_file:
-        return UpdatePublicationResult.ERROR_UPDATE_DOCUMENT_FAILED
-    
-    publication.publication_document_id = publication.publication_document_id
-    publication.save(force_update=True)
-    
-    logger.info(
-        "Publication with VAT: %s, NUMBER: %s, and DATE: %s already exists but some fields are not the same. "
-        "Updating Metadata",
-        publication.legal_entity_vat,
-        publication.publication_number,
-        publication.publication_date,
-    )
-    publication.save(force_update=True)
-    
-    return UpdatePublicationResult.OK_UPDATED_SUCCESSFULLY
+    def _handle_metadata_update(
+        self, publication: LegalEntityPublication, log_pub
+    ) -> UpdatePublicationResult:
+        """Handle publication with different metadata."""
+        log_pub(
+            "Publication VAT: %s, NUMBER: %s, DATE: %s exists with different metadata. "
+            "Updating...",
+            level="info"
+        )
+        publication.save(force_update=True)
+        return UpdatePublicationResult.OK_UPDATED_SUCCESSFULLY

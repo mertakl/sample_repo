@@ -9,15 +9,17 @@ default:
 variables:
   DOCKER_IMAGE_NAME: "aidi/aidi-ta02"
 
-# Consolidated workflow rules - run on MRs and specific branch conditions
+# Consolidated workflow rules - run only on MRs and master branch events
 workflow:
   rules:
     - if: $CI_COMMIT_TAG
       when: never
+    # Run on master for version releases
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^\(\d+\.\d+\.\d+\)/
+    # Run on master after merge (for release jobs only)
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^Merge branch\//
-    - if: $CI_COMMIT_BRANCH
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    # Run ONLY when merge request exists (not on regular pushes)
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 before_script:
   - if [[ -v UV_VERSION ]]; then pip3 install uv==${UV_VERSION}; else pip3 install uv; fi
@@ -28,10 +30,8 @@ before_script:
     # Skip on master merge commits (already tested in MR)
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^Merge branch\//
       when: never
-    # Run on feature branches
-    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
-    # Run on tags
-    - if: $CI_COMMIT_TAG
+    # Run only on merge request pipelines
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 .master_only_rules: &master_only_rules
   rules:

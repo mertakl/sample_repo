@@ -1,186 +1,191 @@
-def update_publication_document_from_moniteur_belge(
-    self,
-    publication: LegalEntityPublication,
-    cancellation_event: Event | None = None,
-) -> UpdatePublicationResult:
-    """
-    Update or create a publication document from Moniteur Belge.
-    
-    Args:
-        publication: The publication to update or create
-        cancellation_event: Optional event to cancel the operation
-        
-    Returns:
-        UpdatePublicationResult indicating the outcome of the operation
-    """
-    if self._is_cancelled(cancellation_event, publication):
-        return UpdatePublicationResult.CANCELLED
+include:
+  - project: "Production-mutualisee/IPS/IDO/gitlab-cicd/pipelines"
+    file: ".gitlab-ci.yml"
 
-    if not publication.publication_document_id:
-        return UpdatePublicationResult.IGNORED
+default:
+  tags:
+    - "ocp_xl"
 
-    try:
-        result = self._process_publication(publication)
-    except Exception as e:
-        result = self._handle_error(publication, e)
-    finally:
-        connection.close()
+variables:
+  DOCKER_IMAGE_NAME: "aidi/aidi-ta02"
 
-    return result
+# Consolidated workflow rules - run on MRs and specific branch conditions
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^\(\d+\.\d+\.\d+\)/
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^Merge branch\//
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
 
+before_script:
+  - if [[ -v UV_VERSION ]]; then pip3 install uv==${UV_VERSION}; else pip3 install uv; fi
+  - export PATH=/.local/bin:$PATH
 
-def _is_cancelled(
-    self, 
-    cancellation_event: Event | None, 
-    publication: LegalEntityPublication
-) -> bool:
-    """Check if the operation has been cancelled."""
-    if cancellation_event and cancellation_event.is_set():
-        logger.debug(
-            "Cancelled update for publication (VAT: %s, NUMBER: %s, DATE: %s)",
-            publication.legal_entity_vat,
-            publication.publication_number,
-            publication.publication_date,
-        )
-        return True
-    return False
+.default_rules: &default_rules
+  rules:
+    # Skip on master merge commits (already tested in MR)
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^Merge branch\//
+      when: never
+    # Run on feature branches
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+    # Run on tags
+    - if: $CI_COMMIT_TAG
 
+.master_only_rules: &master_only_rules
+  rules:
+    # Only run on master for version tags or explicit deployments
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^\(\d+\.\d+\.\d+\)/
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE =~ /^Merge branch\//
+      when: never
 
-def _process_publication(
-    self, 
-    publication: LegalEntityPublication
-) -> UpdatePublicationResult:
-    """Process the publication based on whether it exists or not."""
-    logger.debug(
-        "Processing publication (VAT: %s, NUMBER: %s, DATE: %s)",
-        publication.legal_entity_vat,
-        publication.publication_number,
-        publication.publication_date,
-    )
+stages:
+  - build_image
+  - testing
+  - update_sonar
+  - marvin_release
+  - security_scans
 
-    existing_publication = self._get_existing_publication(publication)
+# ============================================================================
+# BUILD STAGE
+# ============================================================================
+build:
+  stage: build_image
+  image: $CI_REGISTRY/$CLOUDTOOLS_IMAGE_TAG
+  before_script:
+    - "# Override global before_script"
+  timeout: 3h
+  script:
+    - docker login $PROJECT_DOCKER_REGISTRY -u $ARTIFACTORY_USER -p $ARTIFACTORY_PASSWORD
+    - docker build
+      -t $DOCKER_IMAGE_NAME:$CI_COMMIT_SHA
+      --network=host
+      --progress=plain
+      --build-arg ARTIFACTORY_USER=${ARTIFACTORY_USER}
+      --build-arg ARTIFACTORY_PASSWORD=${ARTIFACTORY_PASSWORD}
+      --cache-from $DOCKER_IMAGE_NAME:$CI_COMMIT_SHA
+      .
+  <<: *default_rules
+  
+  after_script:
+    - docker images
+  needs: []
+  rules:
+    - !reference [.default_rules, rules]
 
-    if not existing_publication:
-        return self._create_new_publication(publication)
-    
-    if self._publications_are_identical(existing_publication, publication):
-        return self._handle_identical_publication(publication)
-    
-    if not existing_publication.publication_document_id:
-        return self._update_missing_document(publication)
-    
-    return self._update_metadata(publication)
+# ============================================================================
+# TESTING STAGE
+# ============================================================================
+code_quality:
+  stage: testing
+  image: $CI_REGISTRY/python:3.12
+  script:
+    - '![[ -v CI_MERGE_REQUEST_TARGET_BRANCH_NAME ]] && FROM_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" || FROM_REF="$CI_DEFAULT_BRANCH"'
+    - git fetch origin $FROM_REF
+    - uv run --dev --no-cache pre-commit run --from-ref "origin/$FROM_REF" --to-ref HEAD --show-diff-on-failure
+    - uv run --dev --no-cache ruff check --output-format=gitlab > gl-code-quality-report.json
+  <<: *default_rules
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
 
+pytest:
+  stage: testing
+  image: $CI_REGISTRY/python:3.12
+  script:
+    - uv run --group test --no-cache bash -c "
+      coverage erase &&
+      export DJANGO_SETTINGS_MODULE=django_project.settings.local &&
+      python manage.py migrate &&
+      coverage run -m pytest tests/functional --junitxml=report_test.xml &&
+      coverage report --fail-under=\"${COVERAGE_MIN_PC}\" &&
+      coverage xml -i &&
+      coverage html"
+  coverage: '/TOTAL.*\s+(\d+)%/'
+  <<: *default_rules
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      junit: report_test.xml
+    paths:
+      - coverage.xml
+      - report.xml
+      - report.html
+      - htmlcov/
+      - pylint-report.txt
+    expire_in: 30 days
 
-def _get_existing_publication(
-    self, 
-    publication: LegalEntityPublication
-) -> LegalEntityPublication | None:
-    """Retrieve existing publication from database."""
-    return LegalEntityPublication.objects.filter(
-        legal_entity_vat=publication.legal_entity_vat,
-        publication_number=publication.publication_number,
-        publication_date=publication.publication_date,
-    ).first()
+# ============================================================================
+# SONAR ANALYSIS
+# ============================================================================
+update_sonar:
+  stage: update_sonar
+  image: $CI_REGISTRY/$SONAR_SCANNER_IMAGE_TAG
+  before_script:
+    - "# Override global before_script"
+  allow_failure: false
+  script:
+    - sonar-scanner
+      -Dsonar.projectKey=${SONAR_PROJECT_KEY}
+      # ... rest of sonar config
+  needs:
+    - job: code_quality
+      artifacts: true
+    - job: pytest
+      artifacts: true
+  rules:
+    # Run on feature branches and master (for tracking)
+    - if: $CI_COMMIT_BRANCH
 
+# ============================================================================
+# RELEASE TO MARVIN (Master Only)
+# ============================================================================
+marvin_release:
+  stage: marvin_release
+  image: $CI_REGISTRY/$CLOUDTOOLS_IMAGE_TAG
+  before_script:
+    - "# Override global before_script"
+  script:
+    - set -xv &&
+      wget -S --no-check-certificate --header='Content-Type: application/json' --post-data "{
+        \"PROJECT\":\"$CI_PROJECT_PATH\",
+        \"APPLICATION_CODE\":\"$APP_NAME\",
+        \"PUBLISH_GITLAB\":\"$PUBLISH_GITLAB\",
+        \"PUBLISH_DOCKER\":\"$PUBLISH_DOCKER\",
+        \"APP_NAME\":\"$APP_NAME\",
+        \"APCODE\":\"$APCODE\",
+        \"DESCRIPTION\":\"$DESCRIPTION\",
+        \"MARVIN_AP_CODE\":\"$MARVIN_AP_CODE\",
+        \"MARVIN_DEV_ENV\":\"$MARVIN_DEV_ENV\",
+        \"ENABLE_RELEASE_MARVIN\":\"$ENABLE_RELEASE_MARVIN\",
+        \"ARTIFACTORY_3098_ENABLED\":\"$ARTIFACTORY_3098_ENABLED\",
+        \"CREDENTIAL_NAME\":\"$CREDENTIAL_NAME\"
+      }" $JENKINS_URL/generic-webhook-trigger/invoke?token=$JENKINS_MARVIN_RELEASE_TOKEN
+  <<: *master_only_rules
+  needs:
+    - job: update_sonar
 
-def _publications_are_identical(
-    self,
-    existing: LegalEntityPublication,
-    new: LegalEntityPublication
-) -> bool:
-    """Check if two publications are identical."""
-    return existing == new
-
-
-def _create_new_publication(
-    self, 
-    publication: LegalEntityPublication
-) -> UpdatePublicationResult:
-    """Create a new publication entry and download its document."""
-    logger.debug(
-        "Creating new publication (VAT: %s, NUMBER: %s, DATE: %s)",
-        publication.legal_entity_vat,
-        publication.publication_number,
-        publication.publication_date,
-    )
-
-    successfully_saved = self._download_n_save_document(publication)
-
-    if not successfully_saved:
-        publication.publication_document_id = None
-        return UpdatePublicationResult.ERROR_METADATA_CREATED_BUT_DOCUMENT_FAILED
-    
-    publication.save(force_insert=True)
-    return UpdatePublicationResult.OK_CREATED_SUCCESSFULLY
-
-
-def _handle_identical_publication(
-    self, 
-    publication: LegalEntityPublication
-) -> UpdatePublicationResult:
-    """Handle case where publication already exists and is identical."""
-    logger.debug(
-        "Publication already exists and is up-to-date (VAT: %s, DATE: %s)",
-        publication.legal_entity_vat,
-        publication.publication_date,
-    )
-    return UpdatePublicationResult.OK_NO_NEED_TO_UPDATE
-
-
-def _update_missing_document(
-    self, 
-    publication: LegalEntityPublication
-) -> UpdatePublicationResult:
-    """Update publication that exists but is missing its document."""
-    logger.debug(
-        "Updating publication with missing document (VAT: %s, NUMBER: %s, DATE: %s)",
-        publication.legal_entity_vat,
-        publication.publication_number,
-        publication.publication_date,
-    )
-    
-    logger.info(
-        "Retrying download for previously missing file: %s",
-        publication.document_url,
-    )
-
-    successfully_saved = self._download_n_save_document(publication)
-
-    if not successfully_saved:
-        return UpdatePublicationResult.ERROR_UPDATE_DOCUMENT_FAILED
-    
-    publication.save(force_update=True)
-    return UpdatePublicationResult.OK_DOCUMENT_UPDATED_SUCCESSFULLY
-
-
-def _update_metadata(
-    self, 
-    publication: LegalEntityPublication
-) -> UpdatePublicationResult:
-    """Update metadata for existing publication with different fields."""
-    logger.info(
-        "Updating metadata for publication (VAT: %s, NUMBER: %s, DATE: %s)",
-        publication.legal_entity_vat,
-        publication.publication_number,
-        publication.publication_date,
-    )
-
-    publication.save(force_update=True)
-    return UpdatePublicationResult.OK_UPDATED_SUCCESSFULLY
-
-
-def _handle_error(
-    self, 
-    publication: LegalEntityPublication, 
-    error: Exception
-) -> UpdatePublicationResult:
-    """Handle and log errors that occur during publication processing."""
-    logger.error(
-        "Error processing publication (VAT: %s, DATE: %s): %s",
-        publication.legal_entity_vat,
-        publication.publication_date,
-        str(error),
-        exc_info=True,
-    )
-    return UpdatePublicationResult.ERROR_OTHER
+# ============================================================================
+# SECURITY SCANS (Master Only)
+# ============================================================================
+security_scans:
+  stage: security_scans
+  image: $CI_REGISTRY/$CLOUDTOOLS_IMAGE_TAG
+  before_script:
+    - "# Override global before_script"
+  script:
+    - wget --no-check-certificate -S --header='Content-Type: application/json' --post-data "{
+        \"ENABLE_NEXUS_IQ\":\"true\",
+        \"ENABLE_FORTIFY\":\"true\",
+        \"PROJECT_PATH_MAP\":\"dm/fortis/tribe_artificial_intelligence/aidi/aidi-ta02:AIDI\",
+        \"BRANCH\":\"$CI_COMMIT_BRANCH\",
+        \"DECLARE_PROJECT_IN_FORTIFY_AND_NEXUSIQ\":\"false\",
+        \"CREDENTIAL_NAME\":\"$CREDENTIAL_NAME\"
+      }" $JENKINS_URL/generic-webhook-trigger/invoke?token=$JENKINS_TOKEN
+  <<: *master_only_rules
+  needs:
+    - job: update_sonar

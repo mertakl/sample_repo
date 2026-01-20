@@ -139,6 +139,87 @@ class PostgresTsVectorAdapter(BaseSearchAdapter):
         pass
 
 
+import json
+import bm25s
+from pathlib import Path
+from collections import defaultdict
+from pydantic import Field, PrivateAttr
+
+class Bm25Adapter(BaseSearchAdapter):
+    """
+    Adapter for In-Memory BM25 Search.
+    """
+    chunks: List[DocumentChunk] = Field(default_factory=list)
+    bm25_retriever: Any = None # Typed as Any to avoid Pydantic validaton issues with external libs
+    nb_retrieved_doc_factor: int = 1
+    
+    # Internal index for fast lookups
+    _key_to_chunks: dict = PrivateAttr(default_factory=lambda: defaultdict(list))
+
+    def model_post_init(self, __context: Any) -> None:
+        """Initialize the internal lookup map and index if chunks exist."""
+        for chunk in self.chunks:
+            self._key_to_chunks[chunk.key].append(chunk)
+
+        corpus = list(self._key_to_chunks.keys())
+        
+        # Initialize retriever if not provided
+        if not self.bm25_retriever and corpus:
+            self.bm25_retriever = bm25s.BM25(corpus=corpus)
+            corpus_tokens = bm25s.tokenize(corpus)
+            self.bm25_retriever.index(corpus_tokens)
+
+    async def search(self, query: SearchQuery, max_k: int = 10) -> List[QueryResponse]:
+        if not self.bm25_retriever:
+            return []
+
+        # Tokenize query
+        query_tokens = bm25s.tokenize(query.text)
+        
+        # Adjust retrieval count based on filters
+        clauses = query.filter_clauses or []
+        factor = self.nb_retrieved_doc_factor if clauses else 1
+        
+        # Perform retrieval
+        docs, scores = self.bm25_retriever.retrieve(
+            query_tokens, k=max_k * factor
+        )
+        
+        # Unwrap 2D arrays from bm25s
+        doc_keys = docs[0]
+        doc_scores = scores[0]
+
+        responses = []
+        for key, score in zip(doc_keys, doc_scores):
+            matching_chunks = self._key_to_chunks.get(key, [])
+            
+            for chunk in matching_chunks:
+                # Apply filters
+                if not clauses or all(clause.matches(chunk) for clause in clauses):
+                    responses.append(QueryResponse(chunk=chunk, score=float(score)))
+                    
+                    if len(responses) >= max_k:
+                        return responses
+        
+        return responses
+
+    # --- Persistence Methods (Specific to this adapter) ---
+    
+    @classmethod
+    def load_from_disk(cls, path: str) -> "Bm25Adapter":
+        path_obj = Path(path)
+        # Load logic (simplified from your original code)
+        retriever = bm25s.BM25.load(str(path_obj), load_corpus=True)
+        # Load wrapper data
+        data = json.loads((path_obj / "rt_database.json").read_text())
+        data['bm25_retriever'] = retriever
+        return cls(**data)
+
+    async def select(self, filter_clauses: List[ChunkFilterClause]):
+        # Simple in-memory filtering
+        return [c for c in self.chunks if all(f.matches(c) for f in filter_clauses)]
+
+
 class SearchDatabaseFactory:
     @staticmethod
     def get_database(

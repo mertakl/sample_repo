@@ -1,257 +1,258 @@
-from abc import ABC, abstractmethod
-from typing import Any, List, Tuple
-from pydantic import BaseModel, ConfigDict
-# Assuming these imports exist in your library
-from my_library import (
-    ChunkDatabase, Document, DocumentChunk, QueryResponse, 
-    SearchQuery, ChunkFilterClause, PGVectorDBConfig
-)
-
-class BaseSearchAdapter(ChunkDatabase, ABC):
-    """
-    Base Adapter that implements shared logic for all search implementations.
-    This serves as the 'Port' extension for your specific domain logic.
-    """
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    @abstractmethod
-    async def search(self, query: SearchQuery, max_k: int = 10) -> List[QueryResponse]:
-        """Core search method to be implemented by adapters."""
-        pass
-
-    # --- Shared Logic (Moved from TsVectorDatabase to here) ---
-    
-    @staticmethod
-    def _document_to_chunk(document: Document) -> DocumentChunk:
-        """Shared utility to convert Document to DocumentChunk."""
-        metadata = document.metadata or {}
-        # Mapping logic (simplified for brevity, insert your full mapping here)
-        return DocumentChunk(
-            key=document.page_content,
-            content=metadata.get("content", ""),
-            document_id=metadata.get("document_id", ""),
-            metadata=metadata.get("metadata", {}),
-            # ... include other fields (span, tables, etc) from your original code
-        )
-
-    @classmethod
-    def _create_response(cls, document: Document, score: float) -> QueryResponse:
-        chunk = cls._document_to_chunk(document)
-        return QueryResponse(chunk=chunk, score=score, metadata=document.metadata or {})
-
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import logging
+from typing import List
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import os
+
+from rag_toolbox.chunk_database import Bm25InMemoryDatabase
+from your_module import (  # Replace with your actual imports
+    BaseSearchAdapter,
+    SearchQuery,
+    QueryResponse,
+    Document,
+    DocumentChunk,
+    ChunkFilterClause,
+    Configuration,
+    AVAILABLE_LANGUAGES_TYPE,
+    SimpleCosClient,
+    CosBucketApi,
+    DocumentSplitter,
+)
 
 logger = logging.getLogger(__name__)
 
-class PostgresQueries:
-    """Repository for raw SQL strings."""
-    ALTER_TABLE = "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS document_tsvector tsvector;"
-    CREATE_INDEX = "CREATE INDEX IF NOT EXISTS idx_document_tsvector ON {table} USING GIN(document_tsvector);"
-    
-    # Trigger logic
-    CREATE_FUNC = """
-    CREATE OR REPLACE FUNCTION document_tsvector_trigger() RETURNS trigger AS $$
-    BEGIN
-        NEW.document_tsvector := to_tsvector('{language}', COALESCE(NEW.document, ''));
-        RETURN NEW;
-    END $$ LANGUAGE plpgsql;
-    """
-    
-    CREATE_TRIGGER = """
-    DROP TRIGGER IF EXISTS tsvector_update ON {table};
-    CREATE TRIGGER tsvector_update BEFORE INSERT OR UPDATE ON {table}
-    FOR EACH ROW EXECUTE FUNCTION document_tsvector_trigger();
-    """
 
-    SEARCH = """
-    SELECT document, cmetadata, 
-           ts_rank(document_tsvector, websearch_to_tsquery('{language}', %s)) AS score
-    FROM {table}
-    WHERE document_tsvector @@ websearch_to_tsquery('{language}', %s)
-    ORDER BY score DESC LIMIT %s;
+class BM25SearchAdapter(BaseSearchAdapter):
     """
-
-class PostgresTsVectorAdapter(BaseSearchAdapter):
+    Adapter for BM25-based search using in-memory database.
     """
-    Adapter for Postgres-based Full Text Search.
-    """
-    config: PGVectorDBConfig
-    language: str = "english"
-    table_name: str = "aisc_ap04.langchain_pg_embedding"
+    bm25_db: Bm25InMemoryDatabase
+    language: str
+    nb_retrieved_doc_factor: int = 1
 
-    def _get_connection(self):
-        """Helper to create a raw connection from config."""
-        conn_str = self.config.get_connection_string().replace("+psycopg", "")
-        return psycopg2.connect(conn_str)
+    def __init__(
+        self,
+        configuration: Configuration,
+        language: AVAILABLE_LANGUAGES_TYPE,
+        bm25_db: Bm25InMemoryDatabase,
+        nb_retrieved_doc_factor: int = 1,
+        **kwargs
+    ):
+        super().__init__(configuration=configuration, **kwargs)
+        self.bm25_db = bm25_db
+        self.language = language
+        self.nb_retrieved_doc_factor = nb_retrieved_doc_factor
 
-    def initialize_schema(self):
-        """Idempotent setup of columns and triggers."""
-        conn = self._get_connection()
-        try:
-            with conn.cursor() as cur:
-                # 1. Add Column
-                cur.execute(PostgresQueries.ALTER_TABLE.format(table=self.table_name))
-                # 2. Add Index
-                cur.execute(PostgresQueries.CREATE_INDEX.format(table=self.table_name))
-                # 3. Create Function
-                cur.execute(PostgresQueries.CREATE_FUNC.format(language=self.language))
-                # 4. Create Trigger
-                cur.execute(PostgresQueries.CREATE_TRIGGER.format(table=self.table_name))
-            conn.commit()
-            logger.info("TsVector schema initialized.")
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Schema init failed: {e}")
-            raise
-        finally:
-            conn.close()
+    @classmethod
+    async def from_documents(
+        cls,
+        configuration: Configuration,
+        language: AVAILABLE_LANGUAGES_TYPE,
+        cos_bucket_api: SimpleCosClient | CosBucketApi,
+        data_source_to_documents: dict[str, list[Document]] | None = None,
+        nb_retrieved_doc_factor: int = 1,
+    ) -> "BM25SearchAdapter":
+        """
+        Create BM25SearchAdapter by building index from document objects.
+        """
+        version_folder_name = cls._v_cos_patch(configuration.cos_version)
+
+        if data_source_to_documents is None:
+            data_source_to_documents = cls._read_parsed_documents_from_cos(
+                cos_bucket_api=cos_bucket_api,
+                configuration=configuration,
+                version_folder_name=version_folder_name,
+                language=language,
+            )
+
+        document_splitter = DocumentSplitter(
+            splitter_config=configuration.document_splitter
+        )
+
+        documents: list[Document] = [
+            document
+            for documents in data_source_to_documents.values()
+            for document in documents
+        ]
+
+        chunks: list[DocumentChunk] = await document_splitter.split_documents(
+            documents=documents
+        )
+
+        bm25_db = Bm25InMemoryDatabase.from_documents(
+            chunks,
+            nb_retrieved_doc_factor=nb_retrieved_doc_factor
+        )
+
+        logger.info(f"Built BM25 index from {len(chunks)} chunks for language: {language}")
+
+        return cls(
+            configuration=configuration,
+            language=language,
+            bm25_db=bm25_db,
+            nb_retrieved_doc_factor=nb_retrieved_doc_factor,
+        )
+
+    @classmethod
+    def from_saved_index(
+        cls,
+        configuration: Configuration,
+        language: AVAILABLE_LANGUAGES_TYPE,
+        cos_bucket_api: SimpleCosClient | CosBucketApi,
+    ) -> "BM25SearchAdapter":
+        """
+        Create BM25SearchAdapter by loading a saved index from COS.
+        """
+        version_folder_name = cls._v_cos_patch(configuration.cos_version)
+        path_to_database = cls._get_cos_bm25_directory(
+            configuration=configuration,
+            language=language,
+            version_folder_name=version_folder_name
+        )
+
+        if not cls._bm25_exists_on_cos(
+            configuration=configuration,
+            language=language,
+            cos_bucket_api=cos_bucket_api
+        ):
+            raise FileNotFoundError(f"{path_to_database} is not a valid BM25 backup.")
+
+        logger.info(f"Loading BM25 db for {language}")
+
+        with TemporaryDirectory() as tmp_dir_name:
+            cls._download_bm25_files(
+                cos_bucket_api=cos_bucket_api,
+                path_to_database=path_to_database,
+                tmp_dir_name=tmp_dir_name,
+                configuration=configuration,
+            )
+
+            bm25_db = Bm25InMemoryDatabase.load(path=tmp_dir_name, mmap=True)
+
+        logger.info(f"Successfully loaded BM25 index for {language}")
+
+        return cls(
+            configuration=configuration,
+            language=language,
+            bm25_db=bm25_db,
+        )
 
     async def search(self, query: SearchQuery, max_k: int = 10) -> List[QueryResponse]:
-        conn = self._get_connection()
+        """
+        Perform BM25 search using the in-memory database.
+        """
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                sql = PostgresQueries.SEARCH.format(
-                    language=self.language, 
-                    table=self.table_name
-                )
-                cur.execute(sql, (query.text, query.text, max_k))
-                results = cur.fetchall()
-
-            responses = []
-            for row in results:
-                doc = Document(page_content=row["document"], metadata=row["cmetadata"])
-                score = float(row["score"]) if row["score"] else 0.0
-                responses.append(self._create_response(doc, score))
+            # Assuming bm25_db.search returns list of tuples (Document, score)
+            # Adjust based on actual return type of Bm25InMemoryDatabase.search
+            results = await self.bm25_db.search(query.text, k=max_k)
             
+            # Convert results to QueryResponse objects
+            responses = []
+            for doc, score in results:
+                response = self.create_query_response(doc, score)
+                responses.append(response)
+            
+            logger.info(f"BM25 search returned {len(responses)} results for query: {query.text}")
             return responses
 
         except Exception as e:
-            logger.error(f"Search failed: {e}")
+            logger.error(f"BM25 search failed: {e}", exc_info=True)
             return []
-        finally:
-            conn.close()
 
     async def select(self, filter_clauses: List[ChunkFilterClause]):
-        # Implement selection logic if needed
+        """
+        Implement selection logic if needed for BM25.
+        Note: BM25 in-memory database may not support traditional filtering.
+        """
+        logger.warning("Select operation not implemented for BM25SearchAdapter")
         pass
 
+    # --- Helper methods for COS operations ---
 
-import json
-import bm25s
-from pathlib import Path
-from collections import defaultdict
-from pydantic import Field, PrivateAttr
-
-class Bm25Adapter(BaseSearchAdapter):
-    """
-    Adapter for In-Memory BM25 Search.
-    """
-    chunks: List[DocumentChunk] = Field(default_factory=list)
-    bm25_retriever: Any = None # Typed as Any to avoid Pydantic validaton issues with external libs
-    nb_retrieved_doc_factor: int = 1
-    
-    # Internal index for fast lookups
-    _key_to_chunks: dict = PrivateAttr(default_factory=lambda: defaultdict(list))
-
-    def model_post_init(self, __context: Any) -> None:
-        """Initialize the internal lookup map and index if chunks exist."""
-        for chunk in self.chunks:
-            self._key_to_chunks[chunk.key].append(chunk)
-
-        corpus = list(self._key_to_chunks.keys())
-        
-        # Initialize retriever if not provided
-        if not self.bm25_retriever and corpus:
-            self.bm25_retriever = bm25s.BM25(corpus=corpus)
-            corpus_tokens = bm25s.tokenize(corpus)
-            self.bm25_retriever.index(corpus_tokens)
-
-    async def search(self, query: SearchQuery, max_k: int = 10) -> List[QueryResponse]:
-        if not self.bm25_retriever:
-            return []
-
-        # Tokenize query
-        query_tokens = bm25s.tokenize(query.text)
-        
-        # Adjust retrieval count based on filters
-        clauses = query.filter_clauses or []
-        factor = self.nb_retrieved_doc_factor if clauses else 1
-        
-        # Perform retrieval
-        docs, scores = self.bm25_retriever.retrieve(
-            query_tokens, k=max_k * factor
-        )
-        
-        # Unwrap 2D arrays from bm25s
-        doc_keys = docs[0]
-        doc_scores = scores[0]
-
-        responses = []
-        for key, score in zip(doc_keys, doc_scores):
-            matching_chunks = self._key_to_chunks.get(key, [])
-            
-            for chunk in matching_chunks:
-                # Apply filters
-                if not clauses or all(clause.matches(chunk) for clause in clauses):
-                    responses.append(QueryResponse(chunk=chunk, score=float(score)))
-                    
-                    if len(responses) >= max_k:
-                        return responses
-        
-        return responses
-
-    # --- Persistence Methods (Specific to this adapter) ---
-    
-    @classmethod
-    def load_from_disk(cls, path: str) -> "Bm25Adapter":
-        path_obj = Path(path)
-        # Load logic (simplified from your original code)
-        retriever = bm25s.BM25.load(str(path_obj), load_corpus=True)
-        # Load wrapper data
-        data = json.loads((path_obj / "rt_database.json").read_text())
-        data['bm25_retriever'] = retriever
-        return cls(**data)
-
-    async def select(self, filter_clauses: List[ChunkFilterClause]):
-        # Simple in-memory filtering
-        return [c for c in self.chunks if all(f.matches(c) for f in filter_clauses)]
-
-
-class SearchDatabaseFactory:
     @staticmethod
-    def get_database(
-        strategy: str, 
-        config: dict
-    ) -> BaseSearchAdapter:
+    def _v_cos_patch(cos_version: str) -> str:
+        """Helper to format COS version folder name."""
+        # Implement your version patching logic
+        return cos_version
+
+    @staticmethod
+    def _read_parsed_documents_from_cos(
+        cos_bucket_api: SimpleCosClient | CosBucketApi,
+        configuration: Configuration,
+        version_folder_name: str,
+        language: AVAILABLE_LANGUAGES_TYPE,
+    ) -> dict[str, list[Document]]:
+        """Read parsed documents from COS."""
+        # Implement your document reading logic
+        from your_module import read_parsed_documents_from_cos
         
-        if strategy == "postgres_tsvector":
-            # Initialize Postgres adapter
-            db = PostgresTsVectorAdapter(
-                config=config['pg_config'],
-                language=config.get('language', 'english')
-            )
-            # Optional: ensure schema is ready
-            db.initialize_schema()
-            return db
+        return read_parsed_documents_from_cos(
+            cos_bucket_api=cos_bucket_api,
+            document_object_cos_folder=Path(
+                configuration.document_parser.document_object_cos_folder
+            ),
+            v_cos_patch=version_folder_name,
+            language=language,
+            sources=list(configuration.document_parser.sources.keys()),
+        )
+
+    @staticmethod
+    def _get_cos_bm25_directory(
+        configuration: Configuration,
+        language: AVAILABLE_LANGUAGES_TYPE,
+        version_folder_name: str,
+    ) -> str:
+        """Get COS path for BM25 directory."""
+        from your_module import get_cos_bm25_directory
+        
+        return get_cos_bm25_directory(
+            configuration=configuration,
+            language=language,
+            version_folder_name=version_folder_name
+        )
+
+    @staticmethod
+    def _bm25_exists_on_cos(
+        configuration: Configuration,
+        language: AVAILABLE_LANGUAGES_TYPE,
+        cos_bucket_api: SimpleCosClient | CosBucketApi,
+    ) -> bool:
+        """Check if BM25 index exists on COS."""
+        from your_module import bm25_exists_on_cos
+        
+        return bm25_exists_on_cos(
+            configuration=configuration,
+            language=language,
+            cos_bucket_api=cos_bucket_api
+        )
+
+    @staticmethod
+    def _download_bm25_files(
+        cos_bucket_api: SimpleCosClient | CosBucketApi,
+        path_to_database: str,
+        tmp_dir_name: str,
+        configuration: Configuration,
+    ):
+        """Download BM25 files from COS to temporary directory."""
+        if isinstance(cos_bucket_api, SimpleCosClient):
+            from decouple import config
+            bucket_name = config("AISC_AP04_COS_BUCKET_NAME", default=config("BUCKET"))
             
-        elif strategy == "bm25":
-            if 'path' in config:
-                return Bm25Adapter.load_from_disk(config['path'])
-            else:
-                return Bm25Adapter(chunks=config.get('chunks', []))
-        
+            for cos_filename in cos_bucket_api.client.Bucket(bucket_name).objects.filter(
+                Prefix=path_to_database
+            ):
+                filename = os.path.basename(str(cos_filename.key))
+                file_path = str(Path(tmp_dir_name) / filename)
+                cos_bucket_api.download_file(
+                    key=str(cos_filename.key),
+                    file_path=file_path
+                )
         else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-
-# --- Usage Example ---
-
-# 1. Use BM25
-bm25_db = SearchDatabaseFactory.get_database("bm25", {"chunks": my_chunks})
-results = await bm25_db.search(SearchQuery(text="contract law"))
-
-# 2. Use Postgres
-pg_db = SearchDatabaseFactory.get_database("postgres_tsvector", {"pg_config": my_pg_config})
-results = await pg_db.search(SearchQuery(text="contract law"))
+            for cos_filename in cos_bucket_api.list_files_in_bucket_folder(
+                path_to_database
+            ):
+                filename = Path(cos_filename).name
+                cos_bucket_api.download_file(
+                    cos_filename=cos_filename,
+                    local_filename=str(Path(tmp_dir_name) / filename)
+                )

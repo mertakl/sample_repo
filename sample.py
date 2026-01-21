@@ -3,6 +3,29 @@ import psycopg2
 from unittest.mock import patch
 from search_adapters import TsVectorChunkIndexerAdapter, PostgresQueries, SearchQuery, PGVectorDBConfig
 
+class FakePsycopgCursor:
+    """Simulates a DB cursor to test SQL generation and Row parsing."""
+    def __init__(self, rows=None, raise_on_execute=None):
+        self.rows = rows or []
+        self.executed_queries = []
+        self.raise_on_execute = raise_on_execute
+        self.closed = False
+
+    def execute(self, query, params=None):
+        if self.raise_on_execute:
+            raise self.raise_on_execute
+        # Store query to verify SQL generation logic
+        self.executed_queries.append((query.strip(), params))
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        self.closed = True
+    
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): pass
+
 class FakePsycopgConnection:
     """Simulates a DB connection to test Commit/Rollback logic."""
     def __init__(self, cursor_factory=None, rows_to_return=None, error_to_raise=None):

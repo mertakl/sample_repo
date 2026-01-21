@@ -1,48 +1,59 @@
 import pytest
-from search_adapters import BaseChunkIndexerPort, Document  # Adjust import
+from langchain.schema import Document
 
-class TestBaseChunkIndexerPort:
-    
-    def test_document_to_chunk_success(self):
-        """Test conversion of Document to DocumentChunk with full metadata."""
-        doc = Document(
-            page_content="Main Content",
-            metadata={
-                "content": "Full Content",
-                "document_id": "doc_123",
-                "hyperlinks": [{"url": "http://test.com"}],
-                "metadata": {"author": "Tester"}
-            }
-        )
-        
-        chunk = BaseChunkIndexerPort._document_to_chunk(doc)
-        
-        assert chunk.key == "Main Content"
-        assert chunk.document_id == "doc_123"
-        assert chunk.content == "Full Content"
-        assert len(chunk.hyperlinks) == 1
-        assert chunk.metadata["author"] == "Tester"
+from your_module import BaseChunkIndexerPort
+from your_models import DocumentChunk, QueryResponse
 
-    def test_document_to_chunk_missing_metadata(self):
-        """Test conversion handles missing metadata gracefully."""
-        doc = Document(page_content="Just Content", metadata=None)
-        
-        chunk = BaseChunkIndexerPort._document_to_chunk(doc)
-        
-        assert chunk.key == "Just Content"
-        assert chunk.content == ""  # Default from .get()
-        assert chunk.document_id == ""
 
-    def test_documents_with_scores_to_query_responses(self):
-        """Test batch conversion logic."""
-        doc1 = Document(page_content="A", metadata={"id": 1})
-        doc2 = Document(page_content="B", metadata={"id": 2})
-        input_data = [(doc1, 0.95), (doc2, 0.80)]
+def test_document_to_chunk_success():
+    doc = Document(
+        page_content="hello world",
+        metadata={
+            "content": "content",
+            "document_id": "doc-1",
+            "span_in_document": {"start": 0, "end": 10},
+            "hyperlinks": [],
+            "tables": [],
+            "header_ancestry": [],
+            "headers_before": [],
+            "metadata": {"source": "unit-test"},
+        },
+    )
 
-        # Note: Depending on how you implemented the fix for the variable name bug
-        responses = BaseChunkIndexerPort.documents_wıth_scores_to_query_responses(input_data)
-        
-        assert len(responses) == 2
-        assert responses[0].score == 0.95
-        assert responses[0].chunk.key == "A"
-        assert responses[1].score == 0.80
+    chunk = BaseChunkIndexerPort._document_to_chunk(doc)
+
+    assert isinstance(chunk, DocumentChunk)
+    assert chunk.key == "hello world"
+    assert chunk.document_id == "doc-1"
+    assert chunk.metadata["source"] == "unit-test"
+
+
+def test_document_to_chunk_with_missing_metadata():
+    doc = Document(page_content="hello", metadata=None)
+
+    chunk = BaseChunkIndexerPort._document_to_chunk(doc)
+
+    assert chunk.key == "hello"
+    assert chunk.document_id == ""
+    assert chunk.metadata == {}
+
+
+def test_create_query_response_success():
+    doc = Document(page_content="abc", metadata={"document_id": "x"})
+    score = 0.42
+
+    response = BaseChunkIndexerPort.create_query_response(doc, score)
+
+    assert isinstance(response, QueryResponse)
+    assert response.score == score
+    assert response.chunk.key == "abc"
+
+
+def test_document_to_chunk_invalid_nested_model_raises():
+    doc = Document(
+        page_content="abc",
+        metadata={"span_in_document": "INVALID"},
+    )
+
+    with pytest.raises(Exception):
+        BaseChunkIndexerPort._document_to_chunk(doc)

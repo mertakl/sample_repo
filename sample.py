@@ -1,6 +1,7 @@
 """
 Integration tests for BM25ChunkIndexerAdapter and TsVectorChunkIndexerAdapter.
 Tests cover both success and failure scenarios.
+Fixed to properly handle Pydantic model validation.
 """
 
 import pytest
@@ -10,12 +11,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from typing import List
 
 # Assuming these imports based on your code structure
 from your_module.adapters import BM25ChunkIndexerAdapter, TsVectorChunkIndexerAdapter
 from your_module.models import (
     Document, DocumentChunk, SearchQuery, QueryResponse,
-    Configuration, Span, Hyperlink, TableBlock, TitleBlock
+    Configuration, Span, Hyperlink, TableBlock, TitleBlock,
+    ChunkFilterClause
 )
 from your_module.database import Bm25InMemoryDatabase, PGVectorDBConfig
 
@@ -27,12 +30,15 @@ from your_module.database import Bm25InMemoryDatabase, PGVectorDBConfig
 @pytest.fixture
 def sample_configuration():
     """Create a sample configuration object."""
-    config = Mock(spec=Configuration)
-    config.cos_version = "v1.0"
-    config.document_splitter = Mock()
-    config.document_parser = Mock()
-    config.document_parser.document_object_cos_folder = "test_folder"
-    config.document_parser.sources = {"source1": {}, "source2": {}}
+    # Create actual Configuration object instead of Mock
+    config = Configuration(
+        cos_version="v1.0",
+        document_splitter={},  # Provide actual config structure
+        document_parser={
+            "document_object_cos_folder": "test_folder",
+            "sources": {"source1": {}, "source2": {}}
+        }
+    )
     return config
 
 
@@ -99,6 +105,23 @@ def sample_chunks():
 
 
 @pytest.fixture
+def sample_query_responses(sample_chunks):
+    """Create sample QueryResponse objects."""
+    return [
+        QueryResponse(
+            chunk=sample_chunks[0],
+            score=0.95,
+            metadata={"doc_id": "doc1"}
+        ),
+        QueryResponse(
+            chunk=sample_chunks[1],
+            score=0.85,
+            metadata={"doc_id": "doc2"}
+        )
+    ]
+
+
+@pytest.fixture
 def mock_cos_bucket_api():
     """Create a mock COS bucket API."""
     mock_api = Mock()
@@ -111,23 +134,13 @@ def mock_cos_bucket_api():
 
 
 @pytest.fixture
-def mock_bm25_db():
+def mock_bm25_db(sample_query_responses):
     """Create a mock BM25 in-memory database."""
     mock_db = Mock(spec=Bm25InMemoryDatabase)
     
+    # Use the actual QueryResponse objects
     async def mock_search(query, k):
-        return [
-            QueryResponse(
-                chunk=Mock(key="chunk1", content="Result 1"),
-                score=0.95,
-                metadata={"doc_id": "doc1"}
-            ),
-            QueryResponse(
-                chunk=Mock(key="chunk2", content="Result 2"),
-                score=0.85,
-                metadata={"doc_id": "doc2"}
-            )
-        ]
+        return sample_query_responses[:k]
     
     mock_db.search = AsyncMock(side_effect=mock_search)
     return mock_db
@@ -136,24 +149,12 @@ def mock_bm25_db():
 @pytest.fixture
 def postgres_config():
     """Create a PostgreSQL configuration for testing."""
+    # Create actual config or use Mock properly
     config = Mock(spec=PGVectorDBConfig)
     config.get_connection_string = Mock(
         return_value="postgresql://user:pass@localhost:5432/testdb"
     )
     return config
-
-
-@pytest.fixture
-def mock_postgres_connection():
-    """Create a mock PostgreSQL connection."""
-    mock_conn = Mock()
-    mock_cursor = Mock()
-    mock_conn.cursor = Mock(return_value=mock_cursor)
-    mock_conn.__enter__ = Mock(return_value=mock_conn)
-    mock_conn.__exit__ = Mock(return_value=False)
-    mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-    mock_cursor.__exit__ = Mock(return_value=False)
-    return mock_conn
 
 
 # ============================================================================
@@ -165,26 +166,25 @@ class TestBM25ChunkIndexerAdapter:
 
     @pytest.mark.asyncio
     async def test_from_documents_success(
-        self, sample_configuration, mock_cos_bucket_api, sample_chunks
+        self, sample_configuration, mock_cos_bucket_api, sample_chunks, sample_documents
     ):
         """Test successful creation of BM25 adapter from documents."""
         data_source_to_documents = {
-            "source1": [
-                Document(page_content="Test 1", metadata={}),
-                Document(page_content="Test 2", metadata={})
-            ]
+            "source1": sample_documents
         }
 
-        with patch('your_module.adapters.DocumentSplitter') as mock_splitter, \
+        with patch('your_module.adapters.DocumentSplitter') as mock_splitter_class, \
              patch('your_module.adapters.Bm25InMemoryDatabase') as mock_bm25_class, \
-             patch('your_module.adapters.v_cos_patch', return_value="v1_0"):
+             patch('your_module.adapters.v_cos_patch', return_value="v1_0"), \
+             patch('your_module.adapters.logger'):
             
             # Setup mocks
             mock_splitter_instance = Mock()
             mock_splitter_instance.split_documents = AsyncMock(return_value=sample_chunks)
-            mock_splitter.return_value = mock_splitter_instance
+            mock_splitter_class.return_value = mock_splitter_instance
             
-            mock_bm25_class.from_documents = Mock(return_value=Mock(spec=Bm25InMemoryDatabase))
+            mock_bm25_instance = Mock(spec=Bm25InMemoryDatabase)
+            mock_bm25_class.from_documents = Mock(return_value=mock_bm25_instance)
             
             # Execute
             adapter = await BM25ChunkIndexerAdapter.from_documents(
@@ -199,29 +199,31 @@ class TestBM25ChunkIndexerAdapter:
             assert adapter is not None
             assert adapter.language == "english"
             assert adapter.nb_retrieved_doc_factor == 2
+            assert adapter.bm25_db == mock_bm25_instance
             mock_splitter_instance.split_documents.assert_called_once()
-            mock_bm25_class.from_documents.assert_called_once()
+            mock_bm25_class.from_documents.assert_called_once_with(
+                sample_chunks,
+                nb_retrieved_doc_factor=2
+            )
 
     @pytest.mark.asyncio
     async def test_from_documents_with_empty_documents(
         self, sample_configuration, mock_cos_bucket_api
     ):
         """Test creation with empty document list."""
-        data_source_to_documents = {}
+        data_source_to_documents = {"source1": []}
 
-        with patch('your_module.adapters.DocumentSplitter') as mock_splitter, \
+        with patch('your_module.adapters.DocumentSplitter') as mock_splitter_class, \
              patch('your_module.adapters.Bm25InMemoryDatabase') as mock_bm25_class, \
-             patch.object(
-                 BM25ChunkIndexerAdapter, 
-                 '_read_parsed_documents_from_cos',
-                 return_value={"source1": []}
-             ):
+             patch('your_module.adapters.v_cos_patch', return_value="v1_0"), \
+             patch('your_module.adapters.logger'):
             
             mock_splitter_instance = Mock()
             mock_splitter_instance.split_documents = AsyncMock(return_value=[])
-            mock_splitter.return_value = mock_splitter_instance
+            mock_splitter_class.return_value = mock_splitter_instance
             
-            mock_bm25_class.from_documents = Mock(return_value=Mock(spec=Bm25InMemoryDatabase))
+            mock_bm25_instance = Mock(spec=Bm25InMemoryDatabase)
+            mock_bm25_class.from_documents = Mock(return_value=mock_bm25_instance)
             
             adapter = await BM25ChunkIndexerAdapter.from_documents(
                 configuration=sample_configuration,
@@ -237,21 +239,20 @@ class TestBM25ChunkIndexerAdapter:
 
     @pytest.mark.asyncio
     async def test_from_documents_failure_splitting_error(
-        self, sample_configuration, mock_cos_bucket_api
+        self, sample_configuration, mock_cos_bucket_api, sample_documents
     ):
         """Test failure when document splitting raises an error."""
-        data_source_to_documents = {
-            "source1": [Document(page_content="Test", metadata={})]
-        }
+        data_source_to_documents = {"source1": sample_documents}
 
-        with patch('your_module.adapters.DocumentSplitter') as mock_splitter, \
-             patch('your_module.adapters.v_cos_patch', return_value="v1_0"):
+        with patch('your_module.adapters.DocumentSplitter') as mock_splitter_class, \
+             patch('your_module.adapters.v_cos_patch', return_value="v1_0"), \
+             patch('your_module.adapters.logger'):
             
             mock_splitter_instance = Mock()
             mock_splitter_instance.split_documents = AsyncMock(
                 side_effect=Exception("Splitting failed")
             )
-            mock_splitter.return_value = mock_splitter_instance
+            mock_splitter_class.return_value = mock_splitter_instance
             
             with pytest.raises(Exception, match="Splitting failed"):
                 await BM25ChunkIndexerAdapter.from_documents(
@@ -277,7 +278,12 @@ class TestBM25ChunkIndexerAdapter:
         ), patch(
             'your_module.adapters.Bm25InMemoryDatabase.load',
             return_value=mock_bm25_db
-        ), patch('your_module.adapters.TemporaryDirectory'):
+        ), patch('your_module.adapters.TemporaryDirectory') as mock_tempdir, \
+           patch('your_module.adapters.logger'):
+            
+            # Mock TemporaryDirectory context manager
+            mock_tempdir.return_value.__enter__ = Mock(return_value="/tmp/test")
+            mock_tempdir.return_value.__exit__ = Mock(return_value=False)
             
             adapter = BM25ChunkIndexerAdapter.from_saved_index(
                 configuration=sample_configuration,
@@ -287,7 +293,7 @@ class TestBM25ChunkIndexerAdapter:
             
             assert adapter is not None
             assert adapter.language == "english"
-            assert adapter.bm25_db is not None
+            assert adapter.bm25_db == mock_bm25_db
 
     def test_from_saved_index_failure_not_found(
         self, sample_configuration, mock_cos_bucket_api
@@ -325,7 +331,11 @@ class TestBM25ChunkIndexerAdapter:
         ), patch(
             'your_module.adapters.Bm25InMemoryDatabase.load',
             side_effect=Exception("Loading failed")
-        ), patch('your_module.adapters.TemporaryDirectory'):
+        ), patch('your_module.adapters.TemporaryDirectory') as mock_tempdir, \
+           patch('your_module.adapters.logger'):
+            
+            mock_tempdir.return_value.__enter__ = Mock(return_value="/tmp/test")
+            mock_tempdir.return_value.__exit__ = Mock(return_value=False)
             
             with pytest.raises(Exception, match="Loading failed"):
                 BM25ChunkIndexerAdapter.from_saved_index(
@@ -347,6 +357,7 @@ class TestBM25ChunkIndexerAdapter:
         results = await adapter.search(query, max_k=5)
         
         assert len(results) == 2
+        assert isinstance(results[0], QueryResponse)
         assert results[0].score == 0.95
         assert results[1].score == 0.85
         mock_bm25_db.search.assert_called_once_with("test query", k=5)
@@ -372,16 +383,17 @@ class TestBM25ChunkIndexerAdapter:
         mock_bm25_db = Mock(spec=Bm25InMemoryDatabase)
         mock_bm25_db.search = AsyncMock(side_effect=Exception("Search failed"))
         
-        adapter = BM25ChunkIndexerAdapter(
-            configuration=sample_configuration,
-            language="english",
-            bm25_db=mock_bm25_db
-        )
-        
-        query = SearchQuery(text="test query")
-        results = await adapter.search(query, max_k=5)
-        
-        assert results == []
+        with patch('your_module.adapters.logger'):
+            adapter = BM25ChunkIndexerAdapter(
+                configuration=sample_configuration,
+                language="english",
+                bm25_db=mock_bm25_db
+            )
+            
+            query = SearchQuery(text="test query")
+            results = await adapter.search(query, max_k=5)
+            
+            assert results == []
 
     @pytest.mark.asyncio
     async def test_search_returns_empty_list(self, sample_configuration):
@@ -401,6 +413,22 @@ class TestBM25ChunkIndexerAdapter:
         assert results == []
         mock_bm25_db.search.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_select_not_implemented(self, sample_configuration, mock_bm25_db):
+        """Test that select operation logs warning."""
+        adapter = BM25ChunkIndexerAdapter(
+            configuration=sample_configuration,
+            language="english",
+            bm25_db=mock_bm25_db
+        )
+        
+        with patch('your_module.adapters.logger') as mock_logger:
+            filter_clauses = []
+            await adapter.select(filter_clauses)
+            
+            # Verify warning was logged
+            mock_logger.warning.assert_called_once()
+
 
 # ============================================================================
 # TsVectorChunkIndexerAdapter TESTS
@@ -416,17 +444,22 @@ class TestTsVectorChunkIndexerAdapter:
         mock_conn.cursor = Mock(return_value=mock_cursor)
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
+        mock_conn.commit = Mock()
+        mock_conn.close = Mock()
         
         adapter = TsVectorChunkIndexerAdapter(
             config=postgres_config,
             language="english"
         )
         
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
+        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
+             patch('your_module.adapters.logger'):
+            
             adapter.initialize_schema()
             
             # Verify all SQL operations were executed
-            assert mock_cursor.execute.call_count == 5  # ALTER, CREATE INDEX, CREATE FUNC, DROP TRIGGER, CREATE TRIGGER
+            # ALTER, CREATE INDEX, CREATE FUNC, DROP TRIGGER, CREATE TRIGGER
+            assert mock_cursor.execute.call_count == 5
             mock_conn.commit.assert_called_once()
             mock_conn.close.assert_called_once()
 
@@ -438,13 +471,17 @@ class TestTsVectorChunkIndexerAdapter:
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
         mock_cursor.execute = Mock(side_effect=Exception("SQL error"))
+        mock_conn.rollback = Mock()
+        mock_conn.close = Mock()
         
         adapter = TsVectorChunkIndexerAdapter(
             config=postgres_config,
             language="english"
         )
         
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
+        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
+             patch('your_module.adapters.logger'):
+            
             with pytest.raises(Exception, match="SQL error"):
                 adapter.initialize_schema()
             
@@ -458,39 +495,42 @@ class TestTsVectorChunkIndexerAdapter:
         mock_conn.cursor = Mock(return_value=mock_cursor)
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
+        mock_conn.commit = Mock()
+        mock_conn.close = Mock()
         
         adapter = TsVectorChunkIndexerAdapter(
             config=postgres_config,
             language="spanish"
         )
         
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
+        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
+             patch('your_module.adapters.logger'):
+            
             adapter.initialize_schema()
             
-            # Check that the language was used in the function creation
-            calls = mock_cursor.execute.call_args_list
-            func_call = str(calls[2])  # CREATE FUNC is the 3rd call
-            assert "spanish" in func_call or adapter.language == "spanish"
+            assert adapter.language == "spanish"
+            assert mock_cursor.execute.call_count == 5
 
     @pytest.mark.asyncio
-    async def test_search_success(self, postgres_config):
+    async def test_search_success(self, postgres_config, sample_documents):
         """Test successful search operation."""
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_conn.cursor = Mock(return_value=mock_cursor)
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
+        mock_conn.close = Mock()
         
         # Mock search results
         mock_cursor.fetchall = Mock(return_value=[
             {
-                "document": "Test document 1",
-                "cmetadata": {"doc_id": "doc1"},
+                "document": sample_documents[0].page_content,
+                "cmetadata": sample_documents[0].metadata,
                 "score": 0.95
             },
             {
-                "document": "Test document 2",
-                "cmetadata": {"doc_id": "doc2"},
+                "document": sample_documents[1].page_content,
+                "cmetadata": sample_documents[1].metadata,
                 "score": 0.85
             }
         ])
@@ -501,18 +541,15 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses') as mock_convert:
-            
-            mock_convert.return_value = [
-                Mock(score=0.95),
-                Mock(score=0.85)
-            ]
+             patch('your_module.adapters.logger'):
             
             query = SearchQuery(text="test search")
             results = await adapter.search(query, max_k=5)
             
             assert len(results) == 2
+            assert isinstance(results[0], QueryResponse)
             assert results[0].score == 0.95
+            assert results[1].score == 0.85
             mock_cursor.execute.assert_called_once()
             mock_conn.close.assert_called_once()
 
@@ -525,6 +562,7 @@ class TestTsVectorChunkIndexerAdapter:
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
         mock_cursor.fetchall = Mock(return_value=[])
+        mock_conn.close = Mock()
         
         adapter = TsVectorChunkIndexerAdapter(
             config=postgres_config,
@@ -532,9 +570,7 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses') as mock_convert:
-            
-            mock_convert.return_value = []
+             patch('your_module.adapters.logger'):
             
             query = SearchQuery(text="nonexistent")
             results = await adapter.search(query, max_k=10)
@@ -550,13 +586,16 @@ class TestTsVectorChunkIndexerAdapter:
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
         mock_cursor.execute = Mock(side_effect=Exception("Database error"))
+        mock_conn.close = Mock()
         
         adapter = TsVectorChunkIndexerAdapter(
             config=postgres_config,
             language="english"
         )
         
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
+        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
+             patch('your_module.adapters.logger'):
+            
             query = SearchQuery(text="test")
             results = await adapter.search(query, max_k=5)
             
@@ -572,6 +611,7 @@ class TestTsVectorChunkIndexerAdapter:
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
         mock_cursor.fetchall = Mock(return_value=[])
+        mock_conn.close = Mock()
         
         adapter = TsVectorChunkIndexerAdapter(
             config=postgres_config,
@@ -579,9 +619,7 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses') as mock_convert:
-            
-            mock_convert.return_value = []
+             patch('your_module.adapters.logger'):
             
             query = SearchQuery(text="test & query | with 'special' chars")
             results = await adapter.search(query, max_k=10)
@@ -599,17 +637,18 @@ class TestTsVectorChunkIndexerAdapter:
         mock_conn.cursor = Mock(return_value=mock_cursor)
         mock_cursor.__enter__ = Mock(return_value=mock_cursor)
         mock_cursor.__exit__ = Mock(return_value=False)
+        mock_conn.close = Mock()
         
         # Mock results with different score types
         mock_cursor.fetchall = Mock(return_value=[
             {
                 "document": "Doc 1",
-                "cmetadata": {},
+                "cmetadata": {"doc_id": "doc1"},
                 "score": "0.95"  # String score
             },
             {
                 "document": "Doc 2",
-                "cmetadata": {},
+                "cmetadata": {"doc_id": "doc2"},
                 "score": None  # None score
             }
         ])
@@ -620,19 +659,16 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses', 
-                         side_effect=lambda x: x) as mock_convert:
+             patch('your_module.adapters.logger'):
             
             query = SearchQuery(text="test")
-            await adapter.search(query, max_k=5)
+            results = await adapter.search(query, max_k=5)
             
-            # Check that conversion was called with proper doc-score tuples
-            call_args = mock_convert.call_args[0][0]
-            assert len(call_args) == 2
-            # First score should be converted to float
-            assert isinstance(call_args[0][1], float)
-            # Second score should default to 0.0
-            assert call_args[1][1] == 0.0
+            # Verify scores were converted properly
+            assert len(results) == 2
+            assert isinstance(results[0].score, float)
+            assert results[0].score == 0.95
+            assert results[1].score == 0.0
 
     def test_get_connection_success(self, postgres_config):
         """Test successful database connection creation."""
@@ -648,6 +684,10 @@ class TestTsVectorChunkIndexerAdapter:
             
             assert conn is not None
             mock_connect.assert_called_once()
+            # Verify the connection string is properly formatted
+            call_args = mock_connect.call_args[0][0]
+            assert "postgresql://" in call_args
+            assert "+psycopg" not in call_args
 
     def test_get_connection_failure(self, postgres_config):
         """Test database connection failure."""
@@ -662,35 +702,49 @@ class TestTsVectorChunkIndexerAdapter:
             with pytest.raises(Exception, match="Connection failed"):
                 adapter._get_connection()
 
+    @pytest.mark.asyncio
+    async def test_select_not_implemented(self, postgres_config):
+        """Test that select operation is a pass-through."""
+        adapter = TsVectorChunkIndexerAdapter(
+            config=postgres_config,
+            language="english"
+        )
+        
+        # Should not raise any exception
+        filter_clauses = []
+        result = await adapter.select(filter_clauses)
+        assert result is None
+
 
 # ============================================================================
-# INTEGRATION TESTS (Requires actual databases)
+# HELPER METHOD TESTS
 # ============================================================================
 
-@pytest.mark.integration
-class TestBM25Integration:
-    """Integration tests requiring actual BM25 setup."""
+class TestBaseChunkIndexerPort:
+    """Test base adapter helper methods."""
     
-    @pytest.mark.asyncio
-    async def test_full_workflow_from_documents_to_search(
-        self, sample_configuration, sample_chunks
-    ):
-        """Test complete workflow from document creation to search."""
-        # This would require actual BM25 database setup
-        # Placeholder for actual integration test
-        pass
+    def test_document_to_chunk_conversion(self, sample_documents):
+        """Test Document to DocumentChunk conversion."""
+        document = sample_documents[0]
+        
+        chunk = BM25ChunkIndexerAdapter._document_to_chunk(document)
+        
+        assert isinstance(chunk, DocumentChunk)
+        assert chunk.key == document.page_content
+        assert chunk.content == document.metadata.get("content", "")
+        assert chunk.document_id == document.metadata.get("document_id", "")
 
-
-@pytest.mark.integration
-class TestTsVectorIntegration:
-    """Integration tests requiring actual PostgreSQL database."""
-    
-    @pytest.mark.asyncio
-    async def test_full_workflow_initialize_and_search(self):
-        """Test complete workflow from schema initialization to search."""
-        # This would require actual PostgreSQL database
-        # Placeholder for actual integration test
-        pass
+    def test_create_query_response(self, sample_documents):
+        """Test QueryResponse creation from document and score."""
+        document = sample_documents[0]
+        score = 0.85
+        
+        response = BM25ChunkIndexerAdapter.create_query_response(document, score)
+        
+        assert isinstance(response, QueryResponse)
+        assert response.score == score
+        assert response.chunk.key == document.page_content
+        assert response.metadata == document.metadata
 
 
 if __name__ == "__main__":

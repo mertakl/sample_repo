@@ -1,3 +1,13 @@
+@pytest.fixture
+def postgres_config():
+    """Create a PostgreSQL configuration for testing."""
+    config = Mock(spec=PGVectorDBConfig)
+    config.get_connection_string = Mock(
+        return_value="postgresql://user:pass@localhost:5432/testdb"
+    )
+    return config
+
+
 class TestTsVectorChunkIndexerAdapter:
     """Test suite for TsVectorChunkIndexerAdapter."""
 

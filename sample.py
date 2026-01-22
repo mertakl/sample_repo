@@ -1,7 +1,11 @@
+import pytest
+from unittest.mock import Mock, patch
+
+
 @pytest.fixture
 def postgres_config():
     """Create a PostgreSQL configuration for testing."""
-    config = Mock(spec=PGVectorDBConfig)
+    config = Mock()
     config.get_connection_string = Mock(
         return_value="postgresql://user:pass@localhost:5432/testdb"
     )
@@ -28,7 +32,7 @@ class TestTsVectorChunkIndexerAdapter:
             adapter.initialize_schema()
             
             # Verify all SQL operations were executed
-            assert mock_cursor.execute.call_count == 5  # ALTER, CREATE INDEX, CREATE FUNC, DROP TRIGGER, CREATE TRIGGER
+            assert mock_cursor.execute.call_count == 5
             mock_conn.commit.assert_called_once()
             mock_conn.close.assert_called_once()
 
@@ -103,14 +107,14 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses') as mock_convert:
+             patch.object(adapter, 'documents_with_scores_to_query_responses') as mock_convert:
             
             mock_convert.return_value = [
                 Mock(score=0.95),
                 Mock(score=0.85)
             ]
             
-            query = SearchQuery(text="test search")
+            query = Mock(text="test search")
             results = await adapter.search(query, max_k=5)
             
             assert len(results) == 2
@@ -134,11 +138,11 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses') as mock_convert:
+             patch.object(adapter, 'documents_with_scores_to_query_responses') as mock_convert:
             
             mock_convert.return_value = []
             
-            query = SearchQuery(text="nonexistent")
+            query = Mock(text="nonexistent")
             results = await adapter.search(query, max_k=10)
             
             assert results == []
@@ -159,7 +163,7 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn):
-            query = SearchQuery(text="test")
+            query = Mock(text="test")
             results = await adapter.search(query, max_k=5)
             
             assert results == []
@@ -181,11 +185,11 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses') as mock_convert:
+             patch.object(adapter, 'documents_with_scores_to_query_responses') as mock_convert:
             
             mock_convert.return_value = []
             
-            query = SearchQuery(text="test & query | with 'special' chars")
+            query = Mock(text="test & query | with 'special' chars")
             results = await adapter.search(query, max_k=10)
             
             # Verify the query was executed (even with special chars)
@@ -222,10 +226,10 @@ class TestTsVectorChunkIndexerAdapter:
         )
         
         with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_wıth_scores_to_query_responses', 
+             patch.object(adapter, 'documents_with_scores_to_query_responses', 
                          side_effect=lambda x: x) as mock_convert:
             
-            query = SearchQuery(text="test")
+            query = Mock(text="test")
             await adapter.search(query, max_k=5)
             
             # Check that conversion was called with proper doc-score tuples
@@ -243,7 +247,7 @@ class TestTsVectorChunkIndexerAdapter:
             language="english"
         )
         
-        with patch('your_module.adapters.psycopg2.connect') as mock_connect:
+        with patch('psycopg2.connect') as mock_connect:
             mock_connect.return_value = Mock()
             
             conn = adapter._get_connection()
@@ -258,8 +262,6 @@ class TestTsVectorChunkIndexerAdapter:
             language="english"
         )
         
-        with patch('your_module.adapters.psycopg2.connect', 
-                   side_effect=Exception("Connection failed")):
-            
+        with patch('psycopg2.connect', side_effect=Exception("Connection failed")):
             with pytest.raises(Exception, match="Connection failed"):
                 adapter._get_connection()

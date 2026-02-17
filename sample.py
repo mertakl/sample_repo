@@ -1,44 +1,84 @@
-_SEARCH_TYPE_RULES: dict[str, dict] = {
-    "semantic": {
-        "required": ["semantic_database"],
-        "forbidden": ["lexical_database", "semantic_proportion_before_reranker"],
-    },
-    "lexical": {
-        "required": ["lexical_database"],
-        "forbidden": ["semantic_database", "semantic_proportion_before_reranker"],
-    },
-    "hybrid": {
-        "required": ["semantic_database", "lexical_database", "semantic_proportion_before_reranker"],
-        "forbidden": [],
-    },
-}
+from __future__ import annotations
 
-@model_validator(mode="after")
-def validate(self) -> Self:
-    """Validates reranking setup and required parameters given the search_type."""
-    self._validate_search_k()
-    self._validate_search_type()
-    return self
+from pathlib import Path
+from typing import Any
 
-def _validate_search_k(self) -> None:
-    if self.reranking_model is not None and self.search_k is None:
-        raise ValueError("search_k attribute is required if a reranking model is used.")
-    if self.search_k is not None and self.search_k < self.max_k:
-        raise ValueError("search_k must be >= max_k")
+from pydantic import BaseModel, Field
 
-def _validate_search_type(self) -> None:
-    rules = _SEARCH_TYPE_RULES.get(self.search_type)
-    if rules is None:
-        raise ValueError(f"Unknown search_type: {self.search_type!r}")
 
-    for field in rules["required"]:
-        if getattr(self, field) is None:
-            raise ValueError(
-                f"{field} must be provided when search_type is {self.search_type!r}"
-            )
+# ---------------------------------------------------------------------------
+# Parser models
+# ---------------------------------------------------------------------------
 
-    for field in rules["forbidden"]:
-        if getattr(self, field) is not None:
-            raise ValueError(
-                f"Do not provide {field} when search_type is {self.search_type!r}"
-            )
+class ParserEntry(BaseModel):
+    """A single parser definition (parser_cls + kwargs)."""
+    parser_cls: str
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
+class ParserConfig(BaseModel):
+    type: str  # e.g. "rag_toolbox"
+
+    # Source types per knowledge-base flavour
+    sources: dict[str, list[str]]  # e.g. {"kbm": ["html"], "eureka": ["pdf", "docx"]}
+
+    document_object_cos_folder: Path
+    nota_url_cos_folder: Path
+
+    # Maps file extension -> parser definition
+    extension_to_parser_map: dict[str, ParserEntry]
+
+    # Domain-name extractor per kb flavour (stored as raw strings / lambdas in
+    # the original config; we keep them as plain strings here)
+    source_to_domain_name_extractor: dict[str, str]
+
+    cos_bucket_subfolder: dict[str, list[str]]
+
+    # Files that should be loaded without a table-of-contents
+    filename_without_toc: list[str] = Field(default_factory=list)
+
+    # Maps a letter prefix to a human-readable product name
+    eureka_title_letter_map: dict[str, str] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Splitter models
+# ---------------------------------------------------------------------------
+
+class KeySplitterParams(BaseModel):
+    chunk_size: int
+    chunk_overlap: int
+
+
+class KeySplitter(BaseModel):
+    type: str  # e.g. "RecursiveCharacterTextSplitter"
+    params: KeySplitterParams
+
+
+class SectionChunker(BaseModel):
+    max_title_depth: int
+    size_threshold: int
+    include_links: bool
+
+
+class SplitterConfig(BaseModel):
+    algorithm: str  # e.g. "nested"
+    key_splitter: KeySplitter
+    section_chunker: SectionChunker
+    split_oversized_content: bool = True
+    content_overlap: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Root config
+# ---------------------------------------------------------------------------
+
+class DocumentConfig(BaseModel):
+    parser: ParserConfig
+    splitter: SplitterConfig
+
+    @classmethod
+    def from_django_settings(cls) -> "DocumentConfig":
+        """Convenience factory that reads DOCUMENT_CONFIG from Django settings."""
+        from django.conf import settings  # noqa: PLC0415
+        return cls(**settings.DOCUMENT_CONFIG)

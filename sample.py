@@ -1,267 +1,282 @@
-import pytest
-from unittest.mock import Mock, patch
+------config/configs/llm.py
+from dataclasses import dataclass
+from django.conf import settings
 
 
-@pytest.fixture
-def postgres_config():
-    """Create a PostgreSQL configuration for testing."""
-    config = Mock()
-    config.get_connection_string = Mock(
-        return_value="postgresql://user:pass@localhost:5432/testdb"
-    )
-    return config
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str
+    model_name: str
+    api_key: str
+    temperature: float
+    max_tokens: int
+    timeout: int = 30
 
-
-class TestTsVectorChunkIndexerAdapter:
-    """Test suite for TsVectorChunkIndexerAdapter."""
-
-    def test_initialize_schema_success(self, postgres_config):
-        """Test successful schema initialization."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> 'LLMConfig':
+        return cls(
+            provider=config_dict['provider'],
+            model_name=config_dict['model_name'],
+            api_key=config_dict['api_key'],
+            temperature=config_dict['temperature'],
+            max_tokens=config_dict['max_tokens'],
+            timeout=config_dict.get('timeout', 30),
         )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
-            adapter.initialize_schema()
-            
-            # Verify all SQL operations were executed
-            assert mock_cursor.execute.call_count == 5
-            mock_conn.commit.assert_called_once()
-            mock_conn.close.assert_called_once()
 
-    def test_initialize_schema_failure_rollback(self, postgres_config):
-        """Test schema initialization failure with rollback."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        mock_cursor.execute = Mock(side_effect=Exception("SQL error"))
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
-        )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
-            with pytest.raises(Exception, match="SQL error"):
-                adapter.initialize_schema()
-            
-            mock_conn.rollback.assert_called_once()
-            mock_conn.close.assert_called_once()
+    @classmethod
+    def get_main(cls) -> 'LLMConfig':
+        return cls.from_dict(settings.LLM_CONFIG)
 
-    def test_initialize_schema_with_different_language(self, postgres_config):
-        """Test schema initialization with different language."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="spanish"
-        )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
-            adapter.initialize_schema()
-            
-            # Check that the language was used in the function creation
-            calls = mock_cursor.execute.call_args_list
-            func_call = str(calls[2])  # CREATE FUNC is the 3rd call
-            assert "spanish" in func_call or adapter.language == "spanish"
+    @classmethod
+    def get_evaluation(cls) -> 'LLMConfig':
+        return cls.from_dict(settings.EVALUATION_LLM_CONFIG)
 
-    @pytest.mark.asyncio
-    async def test_search_success(self, postgres_config):
-        """Test successful search operation."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        
-        # Mock search results
-        mock_cursor.fetchall = Mock(return_value=[
-            {
-                "document": "Test document 1",
-                "cmetadata": {"doc_id": "doc1"},
-                "score": 0.95
-            },
-            {
-                "document": "Test document 2",
-                "cmetadata": {"doc_id": "doc2"},
-                "score": 0.85
-            }
-        ])
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
-        )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_with_scores_to_query_responses') as mock_convert:
-            
-            mock_convert.return_value = [
-                Mock(score=0.95),
-                Mock(score=0.85)
-            ]
-            
-            query = Mock(text="test search")
-            results = await adapter.search(query, max_k=5)
-            
-            assert len(results) == 2
-            assert results[0].score == 0.95
-            mock_cursor.execute.assert_called_once()
-            mock_conn.close.assert_called_once()
+    @classmethod
+    def get_guardrails(cls) -> 'LLMConfig':
+        return cls.from_dict(settings.GUARDRAILS_LLM_CONFIG)
 
-    @pytest.mark.asyncio
-    async def test_search_with_no_results(self, postgres_config):
-        """Test search when no results are found."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        mock_cursor.fetchall = Mock(return_value=[])
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
-        )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_with_scores_to_query_responses') as mock_convert:
-            
-            mock_convert.return_value = []
-            
-            query = Mock(text="nonexistent")
-            results = await adapter.search(query, max_k=10)
-            
-            assert results == []
 
-    @pytest.mark.asyncio
-    async def test_search_failure_exception(self, postgres_config):
-        """Test search failure when exception occurs."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        mock_cursor.execute = Mock(side_effect=Exception("Database error"))
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
-        )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn):
-            query = Mock(text="test")
-            results = await adapter.search(query, max_k=5)
-            
-            assert results == []
-            mock_conn.close.assert_called_once()
+@dataclass(frozen=True)
+class EmbeddingConfig:
+    provider: str
+    model_name: str
+    api_key: str
+    dimension: int
+    batch_size: int
 
-    @pytest.mark.asyncio
-    async def test_search_with_special_characters(self, postgres_config):
-        """Test search with special characters in query."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        mock_cursor.fetchall = Mock(return_value=[])
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
+    @classmethod
+    def from_settings(cls) -> 'EmbeddingConfig':
+        config = settings.EMBEDDING_CONFIG
+        return cls(
+            provider=config['provider'],
+            model_name=config['model_name'],
+            api_key=config['api_key'],
+            dimension=config['dimension'],
+            batch_size=config['batch_size'],
         )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_with_scores_to_query_responses') as mock_convert:
-            
-            mock_convert.return_value = []
-            
-            query = Mock(text="test & query | with 'special' chars")
-            results = await adapter.search(query, max_k=10)
-            
-            # Verify the query was executed (even with special chars)
-            mock_cursor.execute.assert_called_once()
-            call_args = mock_cursor.execute.call_args
-            assert query.text in call_args[0][1]
 
-    @pytest.mark.asyncio
-    async def test_search_score_conversion(self, postgres_config):
-        """Test that scores are properly converted to float."""
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor = Mock(return_value=mock_cursor)
-        mock_cursor.__enter__ = Mock(return_value=mock_cursor)
-        mock_cursor.__exit__ = Mock(return_value=False)
-        
-        # Mock results with different score types
-        mock_cursor.fetchall = Mock(return_value=[
-            {
-                "document": "Doc 1",
-                "cmetadata": {},
-                "score": "0.95"  # String score
-            },
-            {
-                "document": "Doc 2",
-                "cmetadata": {},
-                "score": None  # None score
-            }
-        ])
-        
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
-        )
-        
-        with patch.object(adapter, '_get_connection', return_value=mock_conn), \
-             patch.object(adapter, 'documents_with_scores_to_query_responses', 
-                         side_effect=lambda x: x) as mock_convert:
-            
-            query = Mock(text="test")
-            await adapter.search(query, max_k=5)
-            
-            # Check that conversion was called with proper doc-score tuples
-            call_args = mock_convert.call_args[0][0]
-            assert len(call_args) == 2
-            # First score should be converted to float
-            assert isinstance(call_args[0][1], float)
-            # Second score should default to 0.0
-            assert call_args[1][1] == 0.0
+-------config/configs/retrieval.py
+from dataclasses import dataclass
+from django.conf import settings
 
-    def test_get_connection_success(self, postgres_config):
-        """Test successful database connection creation."""
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
-        )
-        
-        with patch('psycopg2.connect') as mock_connect:
-            mock_connect.return_value = Mock()
-            
-            conn = adapter._get_connection()
-            
-            assert conn is not None
-            mock_connect.assert_called_once()
 
-    def test_get_connection_failure(self, postgres_config):
-        """Test database connection failure."""
-        adapter = TsVectorChunkIndexerAdapter(
-            config=postgres_config,
-            language="english"
+@dataclass(frozen=True)
+class VectorDBConfig:
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+    table_name: str
+
+    @classmethod
+    def from_settings(cls) -> 'VectorDBConfig':
+        config = settings.VECTOR_DB_CONFIG
+        return cls(
+            host=config['host'],
+            port=config['port'],
+            database=config['database'],
+            user=config['user'],
+            password=config['password'],
+            table_name=config['table_name'],
         )
-        
-        with patch('psycopg2.connect', side_effect=Exception("Connection failed")):
-            with pytest.raises(Exception, match="Connection failed"):
-                adapter._get_connection()
+
+    @property
+    def connection_string(self) -> str:
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    top_k: int
+    score_threshold: float
+    reranking_enabled: bool
+    hybrid_search: bool
+
+    @classmethod
+    def from_settings(cls) -> 'RetrievalConfig':
+        config = settings.RETRIEVAL_CONFIG
+        return cls(
+            top_k=config['top_k'],
+            score_threshold=config['score_threshold'],
+            reranking_enabled=config['reranking_enabled'],
+            hybrid_search=config['hybrid_search'],
+        )
+
+---config/configs/document.py
+from dataclasses import dataclass
+from typing import Literal
+from django.conf import settings
+
+
+@dataclass(frozen=True)
+class DocumentParserConfig:
+    type: str
+    extract_images: bool
+
+    @classmethod
+    def from_settings(cls) -> 'DocumentParserConfig':
+        config = settings.DOCUMENT_CONFIG['parser']
+        return cls(
+            type=config['type'],
+            extract_images=config['extract_images'],
+        )
+
+
+@dataclass(frozen=True)
+class DocumentSplitterConfig:
+    type: Literal['nested', 'sliding_window']
+    chunk_size: int
+    chunk_overlap: int
+
+    @classmethod
+    def from_settings(cls) -> 'DocumentSplitterConfig':
+        config = settings.DOCUMENT_CONFIG['splitter']
+        return cls(
+            type=config['type'],
+            chunk_size=config['chunk_size'],
+            chunk_overlap=config['chunk_overlap'],
+        )
+
+
+@dataclass(frozen=True)
+class DocumentConfig:
+    parser: DocumentParserConfig
+    splitter: DocumentSplitterConfig
+
+    @classmethod
+    def from_settings(cls) -> 'DocumentConfig':
+        return cls(
+            parser=DocumentParserConfig.from_settings(),
+            splitter=DocumentSplitterConfig.from_settings(),
+        )
+
+------config/managers/prompts.py
+import logging
+from pathlib import Path
+from typing import Optional
+from django.conf import settings
+from django.core.cache import caches
+
+logger = logging.getLogger(__name__)
+
+
+class PromptTemplate:
+    def __init__(self, name: str, content: str):
+        self.name = name
+        self.content = content
+
+    def format(self, **kwargs) -> str:
+        return self.content.format(**kwargs)
+
+    def __str__(self) -> str:
+        return self.content
+
+
+class PromptManager:
+    def __init__(self, prompts_dir: Optional[Path] = None):
+        self.prompts_dir = Path(prompts_dir or settings.PROMPTS_DIR)
+        self.cache = caches['prompts']
+
+    def _cache_key(self, name: str) -> str:
+        return f"prompt:{name}"
+
+    def _load_from_file(self, name: str) -> str:
+        filepath = self.prompts_dir / f"{name}.txt"
+        if not filepath.exists():
+            raise FileNotFoundError(f"Prompt template not found: {filepath}")
+        return filepath.read_text(encoding='utf-8')
+
+    def get(self, name: str) -> PromptTemplate:
+        cache_key = self._cache_key(name)
+        cached = self.cache.get(cache_key)
+
+        if cached:
+            return cached
+
+        try:
+            content = self._load_from_file(name)
+            prompt = PromptTemplate(name, content)
+            self.cache.set(cache_key, prompt)
+            return prompt
+        except Exception as e:
+            logger.error(f"Failed to load prompt '{name}': {e}")
+            raise
+
+    def reload(self, name: str) -> PromptTemplate:
+        self.cache.delete(self._cache_key(name))
+        return self.get(name)
+
+    def clear_cache(self):
+        self.cache.clear()
+
+    # Convenience properties
+    @property
+    def system_rag(self) -> PromptTemplate:
+        return self.get('rag/system')
+
+    @property
+    def user_query(self) -> PromptTemplate:
+        return self.get('rag/user_query')
+
+    @property
+    def retrieval_query(self) -> PromptTemplate:
+        return self.get('retrieval/query_generation')
+
+    @property
+    def keyword_search(self) -> PromptTemplate:
+        return self.get('retrieval/keyword_search')
+
+
+# Singleton
+_prompt_manager: Optional[PromptManager] = None
+
+
+def get_prompt_manager() -> PromptManager:
+    global _prompt_manager
+    if _prompt_manager is None:
+        _prompt_manager = PromptManager()
+    return _prompt_manager
+
+-------config/managers/messages.py
+from typing import Literal
+from django.conf import settings
+
+AVAILABLE_LANGUAGES_TYPE = Literal['en', 'fr', 'de']
+
+
+class MessageManager:
+    """Simple manager for fixed, localized messages."""
+
+    def get(self, key: str, language: AVAILABLE_LANGUAGES_TYPE = 'en', **kwargs) -> str:
+        """Get a localized message, falling back to English."""
+        messages = settings.MESSAGES_CONFIG.get(key, {})
+        message = messages.get(language) or messages.get('en', key)
+
+        if kwargs:
+            return message.format(**kwargs)
+        return message
+
+    # Convenience methods
+    def empty_input(self, language: AVAILABLE_LANGUAGES_TYPE = 'en') -> str:
+        return self.get('empty_input', language)
+
+    def empty_doc_input(self, language: AVAILABLE_LANGUAGES_TYPE = 'en') -> str:
+        return self.get('empty_doc_input', language)
+
+    def no_url_found(self, language: AVAILABLE_LANGUAGES_TYPE = 'en') -> str:
+        return self.get('no_url_found', language)
+
+    def url_found(self, language: AVAILABLE_LANGUAGES_TYPE = 'en', url: str = '') -> str:
+        return self.get('url_found', language, url=url)
+
+
+# Singleton
+_message_manager: Optional[MessageManager] = None
+
+
+def get_message_manager() -> MessageManager:
+    global _message_manager
+    if _message_manager is None:
+        _message_manager = MessageManager()
+    return _message_manager

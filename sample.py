@@ -1,30 +1,19 @@
-# django_threadpool.py
+# config_registry.py
 
-from concurrent.futures import ThreadPoolExecutor
-from django import db
-from functools import wraps
+class ConfigRegistry:
+    _instance = None
 
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
-class DjangoThreadPoolExecutor(ThreadPoolExecutor):
-    """
-    ThreadPoolExecutor that safely manages Django ORM connections.
-    """
+    def initialize(self):
+        self.llm = get_llm_config()
+        self.vector_db = get_vector_db_config()
+        self.retriever = get_retriever_config()
+        self.embedding_model = get_embedding_config()
+        self.document = get_document_config()
+        self.messages = get_messages_config()
 
-    def submit(self, fn, *args, **kwargs):
-        wrapped_fn = self._wrap_with_db_management(fn)
-        return super().submit(wrapped_fn, *args, **kwargs)
-
-    @staticmethod
-    def _wrap_with_db_management(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            # Ensure stale/closed connections are cleaned up
-            db.close_old_connections()
-
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                # VERY IMPORTANT: close connection used by this thread
-                db.connections.close_all()
-
-        return wrapper
+configs = ConfigRegistry()

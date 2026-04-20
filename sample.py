@@ -1,76 +1,38 @@
-# --- Shared constants (from previous refactor) ---
+async def get_eureka_response(self) -> AsyncGenerator[StreamEvent]:
+    ...rest of the code
+    direction = "input"
+    try:
+        _, eureka_response = await asyncio.gather(*tasks)
+        direction = "output"
+        accumulated = ""
+        async for chunk in eureka_response.content_stream:
+            accumulated += chunk
+            yield event_sender.text_delta(delta=chunk)
 
-BASE_HEADERS = {
-    "Language": "fr",
-    "saml-groups": "[]",
-    "X-Bot-Mode": "DEFAULT",
-}
+        if any(is_numerical_cases(case) for case in [eureka_response.user_query, accumulated]):
+            metrics.log(
+                "numerical_case",
+                user_query=eureka_response.user_query,
+                answer=accumulated,
+            )
 
-STREAMING_PAYLOAD = {
-    "messages": [{"role": "user", "content": "Quel est le coût du pack Easy Go ?"}],
-    "stream": True,
-}
+        yield event_sender.text_done(accumulated)
 
-EXPECTED_EVENT_SEQUENCE = [
-    "message.created",
-    "message.in_progress",
-    "message.content.started",
-    "message.text.delta",
-    "message.text.delta",
-    "message.text.delta",
-    "message.text.done",
-    "message.content.done",
-    "message.completed",
-]
+        # ↓ Inner try: only guards the validate call
+        try:
+            await self._output_guard.validate(accumulated)
+        except GuardrailTriggered as error:
+            guardrail_reason = error.guardrail_result.reason
+            yield event_sender.guardrail_triggered(
+                name=error.guardrail_result.guardrail_name,
+                reason=guardrail_reason,
+            )
+            accumulated += guardrail_reason
 
+        # Runs after success OR guardrail — never after a generic exception
+        yield event_sender.content_done(text=accumulated)
+        yield event_sender.completed(content=accumulated)
 
-# --- Helpers ---
-
-def parse_sse_packets(raw_packets: list[str]) -> list[dict]:
-    """Parse raw SSE strings into a list of {event, data} dicts."""
-    parsed = []
-    for packet in raw_packets:
-        event_type = data = None
-        for line in packet.split("\n"):
-            if line.startswith("event:"):
-                event_type = line.removeprefix("event:").strip()
-            elif line.startswith("data:"):
-                data = line.removeprefix("data:").strip()
-        parsed.append({"event": event_type, "data": data})
-    return parsed
-
-
-# --- Tests ---
-
-@pytest.mark.asyncio
-async def test_end_to_end_text_streaming(api_client):
-    async def async_message_stream():
-        for chunk in ("Hello", "", "world!"):
-            yield chunk
-
-    mock_response = MagicMock()
-    mock_response.content_stream = async_message_stream()
-    mock_response.user_query = STREAMING_PAYLOAD["messages"][0]["content"]
-
-    assistant = MagicMock()
-    assistant.next_message_stream = AsyncMock(return_value=mock_response)
-
-    with patch.object(app_initializer, "assistants", {"fr": assistant}):
-        response = await build_post(api_client, STREAMING_PAYLOAD)
-
-    assert response.status_code == 200
-
-    raw_packets = []
-    async for chunk in response.streaming_content:
-        decoded = chunk.decode()
-        assert isinstance(decoded, str)
-        raw_packets.append(decoded)
-
-    assert len(raw_packets) > 0
-
-    parsed_packets = parse_sse_packets(raw_packets)
-
-    assert len(parsed_packets) == len(EXPECTED_EVENT_SEQUENCE)
-    for packet, expected_event in zip(parsed_packets, EXPECTED_EVENT_SEQUENCE):
-        assert packet["event"] == expected_event
-        assert isinstance(packet["data"], str)
+    except Exception as error:  # pylint: disable=W0718
+        logger.exception(error)
+        yield event_sender.error(str(error))

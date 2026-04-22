@@ -1,38 +1,72 @@
-async def get_eureka_response(self) -> AsyncGenerator[StreamEvent]:
-    ...rest of the code
-    direction = "input"
-    try:
-        _, eureka_response = await asyncio.gather(*tasks)
-        direction = "output"
-        accumulated = ""
-        async for chunk in eureka_response.content_stream:
-            accumulated += chunk
-            yield event_sender.text_delta(delta=chunk)
+# Constants to avoid repeated inline sets
+STATUSES_REQUIRING_DOWNLOAD = frozenset({
+    DownloadStatus.RECENTLY_MODIFIED,
+    DownloadStatus.NEW_DOCUMENT,
+    DownloadStatus.DOWNLOAD_FAILED_LAST_SUCCESSFUL_RUN,
+})
 
-        if any(is_numerical_cases(case) for case in [eureka_response.user_query, accumulated]):
-            metrics.log(
-                "numerical_case",
-                user_query=eureka_response.user_query,
-                answer=accumulated,
-            )
 
-        yield event_sender.text_done(accumulated)
+def process_document(
+    self,
+    document: SharepointDocument,
+    failed_download_uids: set[str],
+) -> str:
+    cos_filepath = self.path_manager.get_document_path(
+        uid=document.uid,
+        source=document.source,
+        language=document.language,
+    )
 
-        # ↓ Inner try: only guards the validate call
-        try:
-            await self._output_guard.validate(accumulated)
-        except GuardrailTriggered as error:
-            guardrail_reason = error.guardrail_result.reason
-            yield event_sender.guardrail_triggered(
-                name=error.guardrail_result.guardrail_name,
-                reason=guardrail_reason,
-            )
-            accumulated += guardrail_reason
+    document_status = self._download_document_status(
+        cos_filepath=cos_filepath,
+        document=document,
+        failed_download_uids=failed_download_uids,
+    )
+    logger.info("Document download status for %s is %s", document.uid, document_status)
 
-        # Runs after success OR guardrail — never after a generic exception
-        yield event_sender.content_done(text=accumulated)
-        yield event_sender.completed(content=accumulated)
+    if document_status in STATUSES_REQUIRING_DOWNLOAD:
+        document_status = self._attempt_download(document, cos_filepath)
 
-    except Exception as error:  # pylint: disable=W0718
-        logger.exception(error)
-        yield event_sender.error(str(error))
+    self.download_status[document_status].append(document.uid)
+    return document_status
+
+
+def _attempt_download(
+    self,
+    document: SharepointDocument,
+    cos_filepath: str,
+) -> str:
+    """Try to download document; return updated status."""
+    success = self._download_document_and_upload_to_cos(
+        document=document,
+        cos_filepath=cos_filepath,
+    )
+    if not success:
+        logger.info("Download failed for %s. Skipping document.", document.uid)
+        return DownloadStatus.DOWNLOAD_FAILED
+    return DownloadStatus.DOWNLOAD_SUCCESS
+
+
+def _download_document_status(
+    self,
+    cos_filepath: str,
+    document: SharepointDocument,
+    failed_download_uids: set[str],
+) -> str:
+    """Determine download status based on prior failures, existence, and modification time."""
+    if document.uid in failed_download_uids:
+        return DownloadStatus.DOWNLOAD_FAILED_LAST_SUCCESSFUL_RUN
+
+    if not self.cos_api.file_exists(file_path=cos_filepath):
+        return DownloadStatus.NEW_DOCUMENT
+
+    max_hours = get_max_hours_updated_document(
+        last_success_filepath=self.path_manager.last_success_filepath()
+    )
+    if is_recently_modified(
+        last_modified_str=document.time_last_modified,
+        max_hours_updated_document=max_hours,
+    ):
+        return DownloadStatus.RECENTLY_MODIFIED
+
+    return DownloadStatus.FILE_EXISTS_AND_NOT_MODIFIED

@@ -1,57 +1,32 @@
-def process_document(
+def write_metadata(
     self,
     document: SharepointDocument,
-    failed_download_uids: set[str],
-) -> str:
-    cos_filepath = self.path_manager.get_document_path(
-        uid=document.uid, source=document.source, language=document.language
-    )
+    metadata_path: str,
+    df_metadata: pd.DataFrame | None = None,  # pass existing df to avoid COS read
+) -> pd.DataFrame:
+    """Write metadata to CSV file."""
+    logger.info("Writing metadata information for %s", {document.uid})
 
-    document_status = self._download_document_status(
-        cos_filepath=cos_filepath, document=document, failed_download_uids=failed_download_uids
-    )
-    logger.info("Document download status for %s is %s", document.uid, document_status)
+    # Create new entry
+    metadata = document.model_dump()
+    metadata["uid"] = document.uid  # not in model_dump as it's a property
+    new_entry = pd.DataFrame([metadata])
 
-    if document_status in [
-        DownloadStatus.RECENTLY_MODIFIED,
-        DownloadStatus.NEW_DOCUMENT,
-        DownloadStatus.DOWNLOAD_FAILED_LAST_SUCCESSFUL_RUN,
-    ] and not self._download_document_and_upload_to_cos(
-        document=document, cos_filepath=cos_filepath
-    ):
-        logger.info("Download failed for %s. Skipping document.", document.uid)
-        document_status = DownloadStatus.DOWNLOAD_FAILED
+    # Load df_metadata only if not provided
+    if df_metadata is None:
+        if self.cos_api.file_exists(metadata_path):
+            df_metadata = read_csv(metadata_path, sep=";", cos_client=self.cos_api)
+        else:
+            df_metadata = self._create_empty_dataframe(columns=metadata)
 
-    self.download_status[document_status].append(document.uid)
-    return document_status
+    # Delete entry (if exists)
+    df_metadata = self.remove_metadata(df_metadata=df_metadata, uid=document.uid)
 
-def collect_metadata(
-    self,
-    document: SharepointDocument,
-) -> tuple[Any, str]:
-    """Returns (df_metadata, metadata_path) without saving to COS."""
-    metadata_path = self.path_manager.get_source_metadata_path(source=document.source)
-    df_metadata = self.metadata_manager.write_metadata(
-        document=document, metadata_path=metadata_path
-    )
-    return df_metadata, metadata_path
+    return pd.concat([df_metadata, new_entry], ignore_index=True)
 
-def flush_metadata_to_cos(
-    self,
-    metadata_records: list[tuple[Any, str]],
-) -> None:
-    """Saves metadata to COS once per unique source path."""
-    metadata_by_path: dict[str, Any] = {}
-    for df_metadata, metadata_path in metadata_records:
-        metadata_by_path[metadata_path] = df_metadata  # last write wins per source
 
-    for metadata_path, df_metadata in metadata_by_path.items():
-        self.metadata_manager.save_metadata_on_cos(
-            df_metadata=df_metadata, cos_filepath=metadata_path
-        )
-
-# ...rest of the method
-document_status_per_source_per_type = {source: defaultdict(list) for source in SOURCES}
+# In orchestrator.py - load existing metadata from COS once per source upfront
+metadata_cache: dict[str, pd.DataFrame] = {}
 metadata_records = []
 
 for document in tqdm(all_documents, desc="Processing documents"):
@@ -59,22 +34,30 @@ for document in tqdm(all_documents, desc="Processing documents"):
     status = self.doc_processor.process_document(
         document=document, failed_download_uids=failed_download_uids
     )
-    # Collect metadata instead of saving per document
+
     if status != DownloadStatus.DOWNLOAD_FAILED:
-        df_metadata, metadata_path = self.doc_processor.collect_metadata(document)
-        metadata_records.append((df_metadata, metadata_path))
+        metadata_path = self.doc_processor.path_manager.get_source_metadata_path(
+            source=document.source
+        )
+        # Load from COS once per source, reuse in-memory after
+        if metadata_path not in metadata_cache:
+            if self.doc_processor.cos_api.file_exists(metadata_path):
+                metadata_cache[metadata_path] = read_csv(
+                    metadata_path, sep=";", cos_client=self.doc_processor.cos_api
+                )
+            else:
+                metadata_cache[metadata_path] = None  # will trigger empty df creation
+
+        df_metadata = self.doc_processor.metadata_manager.write_metadata(
+            document=document,
+            metadata_path=metadata_path,
+            df_metadata=metadata_cache[metadata_path],  # pass cached df
+        )
+        metadata_cache[metadata_path] = df_metadata  # update cache with new entry
 
     document_status_per_source_per_type[document.source][status].append(document.uid)
 
-# Single flush to COS after all documents processed
-self.doc_processor.flush_metadata_to_cos(metadata_records)
-
-document_status_per_source_per_type = {
-    source: dict(status)
-    for source, status in document_status_per_source_per_type.items()
-}
-
-# Write logs
-self.doc_processor.write_log_files()
-
-return deleted_uid_per_source, document_status_per_source_per_type
+# Single flush to COS - one write per source
+self.doc_processor.flush_metadata_to_cos(
+    [(df, path) for path, df in metadata_cache.items() if df is not None]
+)

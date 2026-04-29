@@ -92,4 +92,26 @@ class DocumentProcessor(BaseModel):
         return document_statuses
 
 
+# ---orchestrator.py  (rest of the method)
 
+document_status_per_source_per_type = {source: defaultdict(list) for source in SOURCES}
+
+# Single batch call instead of per-document processing
+document_statuses = self.doc_processor.process_documents_batch(
+    documents=all_documents,
+    failed_download_uids=failed_download_uids,
+)
+
+for document in all_documents:
+    status = document_statuses[document.uid]
+    document_status_per_source_per_type[document.source][status].append(document.uid)
+
+document_status_per_source_per_type = {
+    source: dict(status)  # Avoid returning defaultdict
+    for source, status in document_status_per_source_per_type.items()
+}
+
+# Write logs
+self.doc_processor.write_log_files()
+
+return deleted_uid_per_source, document_status_per_source_per_type

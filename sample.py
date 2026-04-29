@@ -1,31 +1,30 @@
-def test_write_metadata_with_existing_df(metadata_manager, sso_document_metadata_only_ineuversal):
-    """Test writing metadata when df_metadata is passed in — no COS read should occur."""
-    existing_df = pd.DataFrame([{"uid": "old_doc", "source": "eureka"}])
-    
-    metadata = EurekaSharepointDocument(
-        title="Test Title",
-        author="Test Author",
-        name="test.docx",
-        server_relative_url="/test/test.docx",
-        url="https://sharepoint.com/sites/test/test.docx",
-        time_last_modified="2023-01-01T00:00:00Z",
-        library="TestLibrary",
-        subfolder="TestFolder",
-        nota_number="123",
-        language="FR",
-        **sso_document_metadata_only_ineuversal,
+def test_orchestrator_collects_metadata_on_success(mocker, orchestrator, mock_document_fetcher, sharepoint_doc):
+    """Test that metadata is collected and COS is checked once per source path on success."""
+    mock_document = mocker.Mock(spec=SharepointDocument)
+    mock_document.source = "eureka"
+    mock_document.name = "test_doc1"
+
+    mock_documents = [sharepoint_doc, mock_document]
+    mock_document_fetcher.get_documents.return_value = mock_documents
+
+    mocker.patch.object(
+        orchestrator.doc_processor,
+        "process_document",
+        return_value=DownloadStatus.NEW_DOCUMENT
     )
 
-    with patch("bnppf_rag_engine.sharepoint.metadata_manager.read_csv") as read_csv_mock:
-        df = metadata_manager.write_metadata(
-            metadata, "test_path.csv", df_metadata=existing_df
-        )
+    mocker.patch(
+        "bnppf_rag_engine.sharepoint.orchestrator.failed_download_uid_from_last_successful_run",
+        return_value=set()
+    )
 
-        # COS should never be touched when df_metadata is provided
-        read_csv_mock.assert_not_called()
-        metadata_manager.cos_api.file_exists.assert_not_called()
+    metadata_path = "path/to/eureka_metadata.csv"
+    orchestrator.doc_processor.path_manager.get_source_metadata_path.return_value = metadata_path
+    orchestrator.doc_processor.cos_api.file_exists.return_value = False
 
-        # Old entry still present, new entry appended
-        assert len(df) == 2
-        assert "old_doc" in df["uid"].values
-        assert "123@FR@docx@TestFolder" in df["uid"].values
+    orchestrator._process_all_documents(LIBRARIES_AND_SUBFOLDERS)
+
+    # file_exists called once per unique source path, not once per document
+    orchestrator.doc_processor.cos_api.file_exists.assert_called_once_with(metadata_path)
+    orchestrator.doc_processor.metadata_manager.write_metadata.assert_called()
+    orchestrator.doc_processor.flush_metadata_to_cos.assert_called_once()

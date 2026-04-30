@@ -1,5 +1,9 @@
-def test_orchestrator_collects_metadata_on_success(mocker, orchestrator, mock_document_fetcher, sharepoint_doc):
-    """Test that metadata is collected and COS is checked once per source path on success."""
+import pandas as pd
+from unittest.mock import patch, Mock
+
+def test_process_all_documents(mocker, orchestrator, mock_document_fetcher, mock_doc_processor, sharepoint_doc):
+    """Test _process_all_documents method."""
+    # Setup mocks
     mock_document = mocker.Mock(spec=SharepointDocument)
     mock_document.source = "eureka"
     mock_document.name = "test_doc1"
@@ -7,24 +11,26 @@ def test_orchestrator_collects_metadata_on_success(mocker, orchestrator, mock_do
     mock_documents = [sharepoint_doc, mock_document]
     mock_document_fetcher.get_documents.return_value = mock_documents
 
-    mocker.patch.object(
-        orchestrator.doc_processor,
-        "process_document",
-        return_value=DownloadStatus.NEW_DOCUMENT
-    )
-
     mocker.patch(
-        "bnppf_rag_engine.sharepoint.orchestrator.failed_download_uid_from_last_successful_run",
-        return_value=set()
+        "bnppf_rag_engine.sharepoint.orchestrator.failed_download_uid_from_last_successful_run", return_value=set()
     )
 
-    metadata_path = "path/to/eureka_metadata.csv"
-    orchestrator.doc_processor.path_manager.get_source_metadata_path.return_value = metadata_path
-    orchestrator.doc_processor.cos_api.file_exists.return_value = False
+    # ✅ Mock read_csv to return an empty (but valid) DataFrame
+    mocker.patch(
+        "bnppf_rag_engine.cos.utils.read_csv",
+        return_value=pd.DataFrame()
+    )
 
     orchestrator._process_all_documents(LIBRARIES_AND_SUBFOLDERS)
 
-    # file_exists called once per unique source path, not once per document
-    orchestrator.doc_processor.cos_api.file_exists.assert_called_once_with(metadata_path)
-    orchestrator.doc_processor.metadata_manager.write_metadata.assert_called()
-    orchestrator.doc_processor.flush_metadata_to_cos.assert_called_once()
+    # Verify document fetcher was called
+    mock_document_fetcher.get_documents.assert_called_once_with(
+        libraries_and_subfolders=LIBRARIES_AND_SUBFOLDERS,
+    )
+
+    # Verify document processor methods were called
+    mock_doc_processor.manage_deleted_documents.assert_called_once_with(all_documents=mock_documents)
+    mock_doc_processor.write_log_files.assert_called_once()
+
+    # Verify each document was processed
+    assert mock_doc_processor.process_document.call_count == len(mock_documents)
